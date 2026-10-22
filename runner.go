@@ -1,6 +1,7 @@
 package outrunner
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -31,20 +32,29 @@ func (p RunnerPhase) String() string {
 	}
 }
 
-// RunnerState holds the full state of a single runner instance.
+// RunnerState holds one runner lifecycle and its local capacity lease.
 type RunnerState struct {
 	Name      string
-	RunnerID  int // from GenerateJitRunnerConfig().Runner.ID
+	RunnerID  int
 	Phase     RunnerPhase
 	CreatedAt time.Time
-	StartedAt time.Time // when Start() completed (provisioning finished)
+	StartedAt time.Time
 
-	done     chan struct{}
-	doneOnce sync.Once
+	done         chan struct{}
+	doneOnce     sync.Once
+	withdraw     chan struct{}
+	withdrawOnce sync.Once
+	lease        *groupLease
+	cleaning     bool
+	cancelJIT    func()
+	jitCtx       context.Context
+	withdrawing  bool
 }
 
-// SignalDone closes the done channel, signaling the runner goroutine to stop.
-// Safe to call multiple times.
 func (r *RunnerState) SignalDone() {
 	r.doneOnce.Do(func() { close(r.done) })
+}
+
+func (r *RunnerState) SignalWithdraw() {
+	r.withdrawOnce.Do(func() { close(r.withdraw) })
 }

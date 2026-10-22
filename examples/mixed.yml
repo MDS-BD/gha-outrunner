@@ -3,6 +3,13 @@
 url: https://github.com/your-org/your-repo
 # token_file: /etc/outrunner/token
 
+# The two macOS definitions share a local cap; demand can use it as 2+0, 1+1, or 0+2.
+# Keep all macOS definitions on this host in one group. Group capacity is process-local:
+# run one controller only, and drain it before maintaining the powered-off base VMs.
+groups:
+  macos:
+    max_runners: 2
+
 runners:
   linux:
     labels: [self-hosted, linux, x64]
@@ -29,12 +36,23 @@ runners:
       # mount:
       #   source: /var/cache/build
 
-  macos:
-    labels: [self-hosted, macos, arm64]
-    max_runners: 1
+  macos-26:
+    labels: [self-hosted, macos-26, arm64]
+    group: macos
+    max_runners: 2
     tart:
-      image: ghcr.io/cirruslabs/macos-sequoia-base:latest
-      runner_cmd: /actions-runner/run.sh
+      image: ci-macos-26-base
+      runner_cmd: /Users/runner/actions-runner/run.sh
+      cpus: 4
+      memory: 8192
+
+  macos-27:
+    labels: [self-hosted, macos-27, arm64]
+    group: macos
+    max_runners: 2
+    tart:
+      image: ci-macos-27-base
+      runner_cmd: /Users/runner/actions-runner/run.sh
       cpus: 4
       memory: 8192
       # Optional: share host directories into the VM via virtiofs.

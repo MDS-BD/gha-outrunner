@@ -52,6 +52,16 @@ See the [Provisioner Reference](../reference/provisioners.md) for details on eac
 
 3. **Shutdown:** On SIGINT, outrunner stops all running environments, deregisters runners from GitHub, and closes all message sessions. Scale sets are kept for reuse on next startup.
 
+## Shared Runner Groups
+
+Runner definitions may join a configured local group with a shared `max_runners` capacity. The group cap limits their aggregate admitted runners, while each definition's `max_runners` remains a hard individual cap. A per-runner cap may exceed the group cap. Ungrouped definitions retain independent per-runner limits. Group names are local scheduler configuration; they are not GitHub runner groups.
+
+The group coordinator is process-local. It accounts for each pool's acknowledged in-flight poll offer as well as active and queued reservations against the shared cap. Capacity withdrawn from a pool is not considered free until a poll roundtrip successfully acknowledges the reduced offer; a poll error retains the previous offer in the accounting. When demand is unknown, discovery offers rotate fairly among pools; known demand is allocated using round-robin, non-preemptive admission. With two runners each capped at two and a group cap of two, the capacity can be allocated 2+0, 1+1, or 0+2 after demand is observed; discovery does not guarantee simultaneous 1+1 allocation before the second pool's assigned demand becomes visible. This does not promise GitHub's global queued-job FIFO order. Running jobs are never preempted. Put all macOS definitions using the same Tart host in one group; separate or ungrouped definitions do not share a cap. Only one controller may manage that Tart store because capacity accounting is not shared across processes.
+This scheduling behavior has not yet been smoke-tested against a real GitHub deployment or Tart host.
+
+Group reservations span provisioning, execution, and stop/delete cleanup. Capacity is released only after cleanup is confirmed; uncertain resource state quarantines the affected slot until controller restart and successful startup reconciliation. Other free slots remain usable. A JIT-only failure before resource creation releases its lease and pauses that pool's admission for 30 seconds before retrying; shutdown cancels that retry. Before listeners advertise capacity, Tart acquires exclusive store ownership and reconciles configured pools. Reconciliation removes only generated disposable clone names and protects base images and unrelated VMs. Prepared bases stay powered off; jobs run in fresh clones that are removed after use.
+
+
 If outrunner crashes without cleanup, the stale scale sets persist. On next startup, outrunner detects them via get-or-create logic and reuses them. Each provisioner also cleans up orphaned environments from previous runs.
 
 ## Authentication Flow

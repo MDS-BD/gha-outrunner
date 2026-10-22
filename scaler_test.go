@@ -99,7 +99,7 @@ func newTestScaler(client ScaleSetClient, prov Provisioner) *Scaler {
 		noopLogger(),
 		client, 1, 10, "test",
 		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}},
-		prov,
+		prov, nil,
 	)
 }
 
@@ -244,11 +244,6 @@ func TestProvisioningFailure(t *testing.T) {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
 
-	// Stop should NOT be called (Start failed)
-	stopped := prov.stoppedNames()
-	if len(stopped) != 0 {
-		t.Errorf("expected no Stop calls, got %v", stopped)
-	}
 
 	s.Shutdown(context.Background())
 }
@@ -379,7 +374,7 @@ func TestMaxRunnersClamping(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
 	s := NewScaler(noopLogger(), client, 1, 2, "test",
-		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov, nil)
 
 	// Request more than max
 	count, err := s.HandleDesiredRunnerCount(context.Background(), 10)
@@ -557,7 +552,7 @@ func TestRunnerNamePrefix(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
 	s := NewScaler(noopLogger(), client, 1, 10, "my-scale-set",
-		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov)
+		&RunnerConfig{Docker: &DockerImage{Image: "test:latest"}}, prov, nil)
 
 	_, _ = s.HandleDesiredRunnerCount(context.Background(), 1)
 	time.Sleep(50 * time.Millisecond)

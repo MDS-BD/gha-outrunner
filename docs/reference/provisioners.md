@@ -164,4 +164,6 @@ How the share appears inside the guest depends on the guest OS:
 
 ### Cleanup
 
-On startup, outrunner runs `tart list --quiet` and deletes any VMs whose name starts with the runner's scale set name prefix (via `tart stop` + `tart delete`).
+When Tart runners share a local capacity group, each job runs in a disposable clone of its configured base. Keep base VMs powered off and never run jobs in or delete them. The controller's startup reconciliation spans every configured Tart pool before any listener starts; it removes only positively identified disposable clones and protects bases and unrelated VMs. Cleanup must be confirmed before the shared slot is released. A failed or uncertain stop/delete quarantines capacity and blocks replacement until reconciliation establishes that the clone is absent. A missing clone is already clean. Run only one controller against a given Tart store: group capacity is process-local, not host-wide coordination between processes. Drain CI before base-image maintenance.
+
+On startup, the controller reconciles every configured Tart pool before listeners begin. It removes only positively identified disposable clones and protects configured base images and unrelated VMs. Cleanup failure or uncertain clone state blocks further admission for the affected capacity until reconciliation confirms resource absence.

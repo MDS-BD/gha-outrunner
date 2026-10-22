@@ -13,7 +13,13 @@ import (
 type Config struct {
 	URL       string                  `yaml:"url"`
 	TokenFile string                  `yaml:"token_file"`
+	Groups    map[string]RunnerGroup  `yaml:"groups,omitempty"`
 	Runners   map[string]RunnerConfig `yaml:"runners"`
+}
+
+// RunnerGroup defines a local capacity limit shared by its member runners.
+type RunnerGroup struct {
+	MaxRunners int `yaml:"max_runners"`
 }
 
 // RunnerConfig defines a runner environment and the scale set it registers.
@@ -25,6 +31,7 @@ type RunnerConfig struct {
 	URL        string        `yaml:"url,omitempty"`
 	TokenFile  string        `yaml:"token_file,omitempty"`
 	Labels     []string      `yaml:"labels"`
+	Group      string        `yaml:"group,omitempty"`
 	MaxRunners int           `yaml:"max_runners,omitempty"`
 	Docker     *DockerImage  `yaml:"docker,omitempty"`
 	Libvirt    *LibvirtImage `yaml:"libvirt,omitempty"`
@@ -106,11 +113,22 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	for name, group := range cfg.Groups {
+		if group.MaxRunners <= 0 {
+			return nil, fmt.Errorf("group %q: max_runners must be greater than zero", name)
+		}
+	}
+
 	if len(cfg.Runners) == 0 {
 		return nil, fmt.Errorf("no runners configured (uncomment the runners section in %s)", path)
 	}
 
 	for name, runner := range cfg.Runners {
+		if runner.Group != "" {
+			if _, ok := cfg.Groups[runner.Group]; !ok {
+				return nil, fmt.Errorf("runner %q: unknown group %q", name, runner.Group)
+			}
+		}
 		if len(runner.Labels) == 0 {
 			return nil, fmt.Errorf("runner %q: labels are required", name)
 		}

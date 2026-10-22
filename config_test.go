@@ -1,6 +1,7 @@
 package outrunner
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,6 +204,89 @@ runners:
 	}
 }
 
+func TestLoadConfigRunnerGroups(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `groups:
+  macos:
+    max_runners: 2
+runners:
+  macos-26:
+    labels: [macos-26]
+    group: macos
+    max_runners: 4
+    docker:
+      image: runner:latest
+  macos-27:
+    labels: [macos-27]
+    group: macos
+    docker:
+      image: runner:latest
+  legacy:
+    labels: [linux]
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Groups["macos"].MaxRunners != 2 {
+		t.Errorf("expected group max_runners 2, got %d", cfg.Groups["macos"].MaxRunners)
+	}
+	if cfg.Runners["macos-26"].Group != "macos" || cfg.Runners["macos-26"].MaxRunners != 4 {
+		t.Errorf("expected group macos and per-runner max_runners 4, got group %q and max %d", cfg.Runners["macos-26"].Group, cfg.Runners["macos-26"].MaxRunners)
+	}
+	if cfg.Runners["macos-27"].Group != "macos" {
+		t.Errorf("expected second runner to join macos group, got %q", cfg.Runners["macos-27"].Group)
+	}
+	if cfg.Runners["legacy"].Group != "" {
+		t.Errorf("expected ungrouped runner to remain ungrouped, got %q", cfg.Runners["legacy"].Group)
+	}
+}
+
+func TestLoadConfigInvalidRunnerGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	content := `runners:
+  linux:
+    labels: [linux]
+    group: missing
+    docker:
+      image: runner:latest
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), `unknown group "missing"`) {
+		t.Fatalf("expected unknown group error, got %v", err)
+	}
+}
+
+func TestLoadConfigInvalidGroupMaxRunners(t *testing.T) {
+	for _, maxRunners := range []int{0, -1} {
+		t.Run(fmt.Sprintf("%d", maxRunners), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yml")
+			content := fmt.Sprintf("groups:\n  macos:\n    max_runners: %d\nrunners:\n  linux:\n    labels: [linux]\n    docker:\n      image: runner:latest\n", maxRunners)
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), "max_runners must be greater than zero") {
+				t.Fatalf("expected invalid group max_runners error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRunnerCmd(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yml")
@@ -387,6 +471,7 @@ runners:
 		t.Errorf("expected token_file /etc/outrunner/token, got %s", cfg.TokenFile)
 	}
 }
+
 
 func TestResolveToken(t *testing.T) {
 	t.Run("flag takes precedence", func(t *testing.T) {

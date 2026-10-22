@@ -1,25 +1,30 @@
-# macOS VM via Tart (Apple Silicon only).
-# Requires: tart installed, OCI image or local VM available.
+# Shared two-slot macOS pool on one Apple Silicon host.
+# Use prepared, powered-off base VMs; Tart creates a disposable clone per job.
+# Existing 1+1 setup: omit groups and set each runner's max_runners to 1.
 url: https://github.com/your-org/your-repo
 # token_file: /etc/outrunner/token
 
-runners:
+groups:
   macos:
-    labels: [self-hosted, macos, arm64]
-    max_runners: 1
+    max_runners: 2
+
+runners:
+  macos-26:
+    labels: [self-hosted, macos-26, arm64]
+    group: macos
+    max_runners: 2
     tart:
-      image: ghcr.io/cirruslabs/macos-sequoia-base:latest
-      runner_cmd: /actions-runner/run.sh
+      image: ci-macos-26-base
+      runner_cmd: /Users/runner/actions-runner/run.sh
       cpus: 4
       memory: 8192
-      # Optional: share host directories into the VM via virtiofs (--dir).
-      # On macOS guests: accessible at /Volumes/My Shared Files/<name>
-      # On Linux guests: mount manually with:
-      #   mount -t virtiofs com.apple.virtio-fs.automount /mnt/shared
-      #   then access at /mnt/shared/<name>
-      # mounts:
-      #   - name: vcpkg
-      #     source: /var/cache/vcpkg
-      #   - name: cargo
-      #     source: /var/cache/cargo
-      #     read_only: false
+
+  macos-27:
+    labels: [self-hosted, macos-27, arm64]
+    group: macos
+    max_runners: 2
+    tart:
+      image: ci-macos-27-base
+      runner_cmd: /Users/runner/actions-runner/run.sh
+      cpus: 4
+      memory: 8192
