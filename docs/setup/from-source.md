@@ -14,7 +14,9 @@ This installs the `outrunner` binary to your `$GOPATH/bin`. No systemd service o
 
 ### GitHub App (recommended)
 
-Create a GitHub App for the repository or organization and grant **Repository permissions → Administration: read and write** for repository-level runners. For organization-level self-hosted runners, grant **Organization permissions → Self-hosted runners: write**. Install the App on the target repository or organization. This polling service does not need webhooks; disable webhook delivery in the App settings (or set `hook_attributes.active: false` in a manifest that configures webhooks).
+Create a GitHub App for the repository or organization. For **repository-scoped** runners (`url: https://github.com/owner/repo`), grant **Repository permissions → Administration: Read and write**; Metadata is read-only. For **organization-scoped** runners (`url: https://github.com/org`), grant **Organization permissions → Self-hosted runners: Read and write**; Repository Administration is **not required**. Install the App on the target organization/repositories. These permissions follow GitHub's [runner authentication guidance](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api); the API scope, not the VM manager, determines the grant.
+
+This polling service does not need webhooks; disable webhook delivery in the App settings. The SDK's internal Actions-service admin token is a short-lived runner-management credential, not a requirement for the GitHub App's Repository Administration permission.
 
 Copy the App Client ID (distinct from the App ID) and the installation ID (also distinct from the App ID). Download the App's private key, store it in a protected file readable only by the outrunner account, and remove other copies. For example:
 
