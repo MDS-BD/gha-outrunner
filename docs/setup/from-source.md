@@ -10,21 +10,49 @@ go install github.com/NetwindHQ/gha-outrunner/cmd/outrunner@latest
 
 This installs the `outrunner` binary to your `$GOPATH/bin`. No systemd service or default config is created.
 
-## 2. Create a GitHub PAT
+## 2. Choose an authentication method
 
-Go to [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta) and create a fine-grained token:
+### GitHub App (recommended)
+
+Create a GitHub App for the repository or organization and grant **Repository permissions → Administration: read and write** for repository-level runners. For organization-level self-hosted runners, grant **Organization permissions → Self-hosted runners: write**. Install the App on the target repository or organization. This polling service does not need webhooks; disable webhook delivery in the App settings (or set `hook_attributes.active: false` in a manifest that configures webhooks).
+
+Copy the App Client ID (distinct from the App ID) and the installation ID (also distinct from the App ID). Download the App's private key, store it in a protected file readable only by the outrunner account, and remove other copies. For example:
+
+```bash
+sudo install -o outrunner -g outrunner -m 0600 github-app-private-key.pem /etc/outrunner/github-app.pem
+```
+
+Configure the App:
+
+```yaml
+url: https://github.com/your-org/your-repo
+app:
+  client_id: Iv1.your-client-id
+  installation_id: 12345678
+  private_key_file: /etc/outrunner/github-app.pem
+
+runners:
+  linux:
+    labels: [self-hosted, linux]
+    docker:
+      image: ghcr.io/actions/actions-runner:latest
+```
+
+### Personal Access Token
+
+For PAT authentication, create a fine-grained token at [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta):
 
 - **Token name:** outrunner
 - **Resource owner:** Your user or organization
 - **Repository access:** Select the repository you want to use
 - **Permissions:** Administration -> Read and write
-
 ## 3. Write a config file
 
-Create `outrunner.yml`:
+Create `outrunner.yml` for the method you chose. For App authentication, use the configuration above; for PAT authentication, use a PAT source such as `token_file`:
 
 ```yaml
 url: https://github.com/your-org/your-repo
+token_file: /etc/outrunner/token
 
 runners:
   linux:
@@ -38,8 +66,7 @@ See the [configuration reference](../reference/configuration.md) for all options
 ## 4. Verify
 
 ```bash
-outrunner --version
-outrunner --token ghp_YOUR_TOKEN --config outrunner.yml
+outrunner --config outrunner.yml
 ```
 
 You should see outrunner connect and start listening for jobs. Press Ctrl+C to stop.
