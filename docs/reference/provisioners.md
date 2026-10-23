@@ -127,7 +127,7 @@ Creates a Tart virtual machine per job by cloning from a base image. Uses `tart 
 3. **Run:** `tart run --no-graphics <name>`. Starts the VM in a background goroutine (blocking command).
 4. **Wait for guest agent:** Polls `tart exec <name> echo ok` until it succeeds (timeout: 3 minutes).
 5. **Start runner:** `tart exec <name> <runner_cmd> --jitconfig <config>`. Runs in a background goroutine.
-6. **Stop:** Cancels the run context, runs `tart stop <name>`, then `tart delete <name>`.
+6. **Stop:** Cancels startup and running commands, waits for them to exit, runs `tart stop <name>` and `tart delete <name>`, then confirms the clone is absent before dropping its ownership record. Cleanup errors are returned and unresolved resources remain tracked.
 
 ### Image Sources
 
@@ -164,4 +164,12 @@ How the share appears inside the guest depends on the guest OS:
 
 ### Cleanup
 
-On startup, outrunner runs `tart list --quiet` and deletes any VMs whose name starts with the runner's scale set name prefix (via `tart stop` + `tart delete`).
+Before workers start, outrunner acquires an exclusive lock in `TART_HOME` (default `~/.tart`) and reconciles clones recorded in `.outrunner-owned-clones.json`. Only recorded owned clones may be deleted; configured base images and foreign collisions are protected. Unrecorded prefix-matching VMs from older versions are preserved with a warning and require manual inspection/removal. Do not delete the ownership manifest while managed clones exist.
+
+Do not manually create or mutate VM names reserved by outrunner while the controller is running. The host lock coordinates outrunner controllers, not arbitrary `tart` commands; a clone failure after its destination is created must remain distinguishable from an external destination collision.
+
+Ownership is reserved before cloning so partial destinations can be recovered after a crash. Startup failures use a fresh bounded cleanup context. `Close` rejects new starts, cancels all tracked work, waits for startup and processes, and removes owned clones; failed cleanup remains tracked and causes a nonzero controller exit. The host lock is held through worker cleanup.
+
+Unexpected VM or runner-command exits notify the scaler and trigger teardown/deregistration. Normal runner exit can precede GitHub's completion callback; the controller does not fabricate a job result. Both SIGINT and SIGTERM use the normal shutdown path.
+
+These paths have local regression and simulated-executable smoke coverage; actual Tart hypervisor behavior must still be verified on a host before production rollout.

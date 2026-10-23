@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Handle SIGTERM through the normal runner shutdown path.
+- Observe unexpected Tart VM and runner exits and tear down their environments without inventing a GitHub job result.
+- Wait for Tart startup and processes during shutdown, clean up partial startup failures with bounded contexts, and report unresolved deletion errors.
+- Replace prefix-based Tart orphan deletion with a persistent ownership manifest and exclusive host lock; protect configured base images and preserve unrecorded VMs.
+
 ## [1.2.0] - 2026-04-20
 
 ### Features
