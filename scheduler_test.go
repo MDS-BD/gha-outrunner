@@ -783,3 +783,92 @@ func TestGroupMessageReturnedWithLocalCancelIsNotLost(t *testing.T) {
 		t.Fatalf("successful message accounting = %d/%d, want %d/0", acked, inflight, offer)
 	}
 }
+
+func TestGroupIdlePollCanIncreaseOfferForHiddenDemand(t *testing.T) {
+	group := newTestGroup(t, 2, "a", "b")
+	group.mu.Lock()
+	group.pollTurn = 1
+	group.pools["b"].ackedKnown = true
+	group.pools["b"].acked = 0
+	group.pools["a"].ackedKnown = true
+	group.pools["a"].acked = 0
+	group.mu.Unlock()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	offer, _ := group.beginPoll("a", cancel)
+	if offer != 0 {
+		t.Fatalf("idle A offer = %d, want zero while B has no reservation", offer)
+	}
+	group.UpdateDemand("a", 0)
+	if cause := context.Cause(ctx); cause != nil {
+		t.Fatalf("idle zero-capacity poll canceled before hidden demand: %v", cause)
+	}
+	group.UpdateDemand("a", 1)
+	if cause := context.Cause(ctx); !errors.Is(cause, errStaleGroupPoll) {
+		t.Fatalf("increased capacity offer cancellation cause = %v, want stale poll", cause)
+	}
+}
+
+func TestGroupStalePollStillInterruptsOnIdleOfferIncrease(t *testing.T) {
+	group := newTestGroup(t, 2, "a", "b")
+	a, b := newTestPoolClient(group, "a"), newTestPoolClient(group, "b")
+	acknowledgeStartupAtZero(t, a, b)
+	bPending, bOffer := beginConsumerPoll(t, b)
+	if bOffer != 0 {
+		t.Fatalf("B discovery offer before A starts = %d, want 0", bOffer)
+	}
+	aPending, aOffer := beginConsumerPoll(t, a)
+	if aOffer != 1 {
+		completeConsumerPoll(t, a, aPending, nil, nil)
+		t.Fatalf("A discovery offer = %d, want 1", aOffer)
+	}
+	if err := completeConsumerPoll(t, a, aPending, pollMessage(0), nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case request := <-b.inner.requests:
+		if request.capacity != 1 {
+			t.Fatalf("reissued idle B offer = %d, want 1", request.capacity)
+		}
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("B's idle poll was not interrupted to increase its offer")
+	}
+	var response chan messagePollResponse
+	select {
+	case response = <-b.inner.responses:
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("reissued B poll did not accept a response")
+	}
+	response <- messagePollResponse{message: pollMessage(0)}
+	if err := <-bPending.done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGroupIdleOfferDecreaseDoesNotInterruptPoll(t *testing.T) {
+	group := newTestGroup(t, 2, "a", "b")
+	a, b := newTestPoolClient(group, "a"), newTestPoolClient(group, "b")
+	acknowledgeStartupAtZero(t, a, b)
+	pending, offer := beginConsumerPoll(t, a)
+	if offer != 1 {
+		t.Fatalf("idle A offer = %d, want 1", offer)
+	}
+	// B acknowledges a capacity offer while A's request remains outstanding.
+	peer, _ := beginConsumerPoll(t, b)
+	if err := completeConsumerPoll(t, b, peer, pollMessage(0), nil); err != nil {
+		t.Fatal(err)
+	}
+	group.mu.Lock()
+	group.pollTurn = 1
+	group.pools["b"].acked = 0
+	group.notifyLocked()
+	cancelled := group.pools["a"].activePoll.cancelled
+	group.mu.Unlock()
+	if cancelled {
+		pending.cancel()
+		t.Fatal("idle discovery decrease interrupted an outstanding poll")
+	}
+	if err := completeConsumerPoll(t, a, pending, pollMessage(0), nil); err != nil {
+		t.Fatal(err)
+	}
+}

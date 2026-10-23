@@ -222,7 +222,11 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 		hostname = uuid.NewString()
 	}
 
-	sessionClient, err := client.MessageSessionClient(ctx, scaleSet.ID, hostname)
+	var sessionOptions []scaleset.HTTPOption
+	if group != nil {
+		sessionOptions = append(sessionOptions, outrunner.GroupedPollHTTPOption(listenerLogger.WithGroup("listener.http")))
+	}
+	sessionClient, err := client.MessageSessionClient(ctx, scaleSet.ID, hostname, sessionOptions...)
 	if err != nil {
 		return fmt.Errorf("runner %s: create message session: %w", name, err)
 	}

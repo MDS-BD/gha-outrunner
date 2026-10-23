@@ -12,6 +12,11 @@ import (
 
 var errStaleGroupPoll = errors.New("group poll offer is stale")
 
+// isStaleGroupPoll reports whether ctx was canceled to replace an outdated capacity offer.
+func isStaleGroupPoll(ctx context.Context) bool {
+	return context.Cause(ctx) == errStaleGroupPoll
+}
+
 // GroupScheduler coordinates capacity shared by runner scale sets in one process.
 // Poll limits guide GitHub routing; leases provide the hard local capacity gate.
 type GroupScheduler struct {
@@ -86,12 +91,28 @@ func (g *GroupScheduler) SetWake(name string, wake chan struct{}) {
 	g.mu.Unlock()
 }
 
-func (g *GroupScheduler) cancelStalePollsLocked() {
-	for name, p := range g.pools {
-		if poll := p.activePoll; poll != nil && !poll.cancelled && g.pollOfferLocked(name) != poll.offer {
-			poll.cancelled = true
-			poll.cancel(errStaleGroupPoll)
+func (g *GroupScheduler) allIdleLocked() bool {
+	for _, p := range g.pools {
+		if p.blocked || p.demand != 0 || p.leases != 0 || p.cleaning != 0 {
+			return false
 		}
+	}
+	return true
+}
+
+func (g *GroupScheduler) cancelStalePollsLocked() {
+	allIdle := g.allIdleLocked()
+	for name, p := range g.pools {
+		poll := p.activePoll
+		if poll == nil || poll.cancelled {
+			continue
+		}
+		offer := g.pollOfferLocked(name)
+		if offer == poll.offer || allIdle && offer < poll.offer {
+			continue
+		}
+		poll.cancelled = true
+		poll.cancel(errStaleGroupPoll)
 	}
 }
 
