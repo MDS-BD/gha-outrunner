@@ -55,8 +55,13 @@ type mockProvisioner struct {
 	started  []string
 	stopped  []string
 	startErr error
+	stopErr  error
 	startCh  chan struct{} // if set, Start blocks until closed
+	stopCh   chan struct{} // if set, Stop blocks until closed
+	done     <-chan error
 }
+
+func (m *mockProvisioner) Done(string) <-chan error { return m.done }
 
 func newMockProvisioner() *mockProvisioner {
 	return &mockProvisioner{}
@@ -79,11 +84,22 @@ func (m *mockProvisioner) Start(ctx context.Context, req *RunnerRequest) error {
 	return nil
 }
 
-func (m *mockProvisioner) Stop(_ context.Context, name string) error {
+func (m *mockProvisioner) Stop(ctx context.Context, name string) error {
+	if m.stopCh != nil {
+		select {
+		case <-m.stopCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
+	stopErr := m.stopErr
 	m.mu.Unlock()
-	return nil
+	return stopErr
 }
 
 func (m *mockProvisioner) Close() error { return nil }
@@ -157,6 +173,56 @@ func TestNonBlockingProvisioning(t *testing.T) {
 	s.Shutdown(context.Background())
 }
 
+func TestProviderExitStopsAndDeregistersRunner(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	exit := make(chan error, 1)
+	prov.done = exit
+	s := newTestScaler(client, prov)
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerPhase(t, s, RunnerIdle)
+	exit <- errors.New("runner process failed")
+	waitForRunnerRemoval(t, s)
+
+	if got := prov.stoppedNames(); len(got) != 1 {
+		t.Errorf("expected one Stop call, got %v", got)
+	}
+	if got := client.removeCount.Load(); got != 1 {
+		t.Errorf("expected one RemoveRunner call, got %d", got)
+	}
+	s.Shutdown(context.Background())
+}
+
+func TestProviderExitCompletionRaceTearsDownOnce(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	exit := make(chan error, 1)
+	prov.done = exit
+	s := newTestScaler(client, prov)
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerPhase(t, s, RunnerIdle)
+	runner := s.Runners()[0]
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: runner.Name, Result: "succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+	exit <- nil
+	waitForRunnerRemoval(t, s)
+
+	if got := prov.stoppedNames(); len(got) != 1 {
+		t.Errorf("expected one Stop call, got %v", got)
+	}
+	if got := client.removeCount.Load(); got != 1 {
+		t.Errorf("expected one RemoveRunner call, got %d", got)
+	}
+	s.Shutdown(context.Background())
+}
+
 func TestHappyPath(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
@@ -217,6 +283,92 @@ func TestHappyPath(t *testing.T) {
 	s.Shutdown(context.Background())
 }
 
+func TestFailedStartRetainsRunnerWhenCleanupFails(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.startErr = context.Canceled
+	prov.stopErr = errors.New("cleanup failed")
+	s := newTestScaler(client, prov)
+
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatalf("HandleDesiredRunnerCount: %v", err)
+	}
+	waitForRunnerPhase(t, s, RunnerStopping)
+
+	runners := s.Runners()
+	if len(runners) != 1 {
+		t.Fatalf("expected failed cleanup reservation to remain, got %v", runners)
+	}
+	if got := prov.stoppedNames(); len(got) != 1 {
+		t.Fatalf("expected failed-start cleanup Stop call, got %v", got)
+	}
+	if got := client.removeCount.Load(); got != 1 {
+		t.Errorf("expected one RemoveRunner call, got %d", got)
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil || count != 1 {
+		t.Errorf("capacity after cleanup failure = (%d, %v), want (1, nil)", count, err)
+	}
+	s.Shutdown(context.Background())
+}
+
+func TestShutdownClosesAdmissionBeforeWait(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.startCh = make(chan struct{})
+	s := newTestScaler(client, prov)
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		s.Shutdown(context.Background())
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not finish after canceling Start")
+	}
+	if count, err := s.HandleDesiredRunnerCount(context.Background(), 1); err == nil || count != 0 {
+		t.Errorf("late admission = (%d, %v), want (0, error)", count, err)
+	}
+	client.mu.Lock()
+	nextID := client.nextID
+	client.mu.Unlock()
+	if nextID != 2 {
+		t.Errorf("late admission generated another JIT config, nextID = %d", nextID)
+	}
+}
+
+func TestShutdownWaitsForRunnerCleanup(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.stopCh = make(chan struct{})
+	s := newTestScaler(client, prov)
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunnerPhase(t, s, RunnerIdle)
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		s.Shutdown(context.Background())
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned before runner cleanup finished")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(prov.stopCh)
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not wait for runner cleanup")
+	}
+}
+
 func TestProvisioningFailure(t *testing.T) {
 	client := newMockClient()
 	prov := newMockProvisioner()
@@ -231,25 +383,42 @@ func TestProvisioningFailure(t *testing.T) {
 		t.Fatalf("expected count 1 (provisioning), got %d", count)
 	}
 
-	// Wait for goroutine to detect failure and clean up
-	time.Sleep(100 * time.Millisecond)
+	// Wait for goroutine to detect failure and clean up.
+	waitForRunnerRemoval(t, s)
 
-	runners := s.Runners()
-	if len(runners) != 0 {
-		t.Errorf("expected 0 runners after failure, got %d", len(runners))
-	}
-
-	// RemoveRunner should be called (deregistration)
 	if client.removeCount.Load() != 1 {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
 
-	// Stop should NOT be called (Start failed)
+	// Stop cleans up any resources partially created by Start.
 	stopped := prov.stoppedNames()
-	if len(stopped) != 0 {
-		t.Errorf("expected no Stop calls, got %v", stopped)
+	if len(stopped) != 1 {
+		t.Errorf("expected one Stop call after failed Start, got %v", stopped)
 	}
 
+	s.Shutdown(context.Background())
+}
+
+func TestFailedRunnerStopRetainsCapacityReservation(t *testing.T) {
+	client := newMockClient()
+	prov := newMockProvisioner()
+	prov.stopErr = errors.New("stop failed")
+	s := newTestScaler(client, prov)
+	if _, err := s.HandleDesiredRunnerCount(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunnerPhase(t, s, RunnerIdle)
+	runner := s.Runners()[0]
+	if err := s.HandleJobCompleted(context.Background(), &scaleset.JobCompleted{RunnerName: runner.Name}); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunnerPhase(t, s, RunnerStopping)
+	if err := s.HandleJobStarted(context.Background(), &scaleset.JobStarted{RunnerName: runner.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Runners()[0].Phase; got != RunnerStopping {
+		t.Errorf("late job-start callback changed stopping phase to %s", got)
+	}
 	s.Shutdown(context.Background())
 }
 
@@ -273,13 +442,13 @@ func TestShutdownDuringProvisioning(t *testing.T) {
 	defer cancel()
 	s.Shutdown(ctx)
 
-	// Runner should be cleaned up
+	// Successful cleanup removes the canceled provisioning reservation.
 	runners = s.Runners()
 	if len(runners) != 0 {
-		t.Errorf("expected 0 runners after shutdown, got %d", len(runners))
+		t.Errorf("expected no runners after successful shutdown cleanup, got %v", runners)
 	}
 
-	// RemoveRunner should be called
+	// RemoveRunner should be called once the failed Start is deregistered.
 	if client.removeCount.Load() != 1 {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
@@ -577,4 +746,30 @@ func TestRunnerNamePrefix(t *testing.T) {
 	}
 
 	s.Shutdown(context.Background())
+}
+
+func waitForRunnerPhase(t *testing.T, s *Scaler, phase RunnerPhase) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, runner := range s.Runners() {
+			if runner.Phase == phase {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("runner did not reach phase %s; runners: %v", phase, s.Runners())
+}
+
+func waitForRunnerRemoval(t *testing.T, s *Scaler) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.Runners()) == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("runner was not removed: %v", s.Runners())
 }

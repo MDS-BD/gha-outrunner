@@ -66,7 +66,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context) (returnErr error) {
 	logger := slog.New(outrunner.NewSimpleHandler(os.Stdout, slog.LevelInfo))
 	listenerLogger := slog.New(outrunner.NewSimpleHandler(os.Stdout, slog.LevelWarn))
 	log.SetOutput(io.Discard)
@@ -131,6 +131,43 @@ func run(ctx context.Context) error {
 			key:        key,
 		})
 	}
+	// Reconcile all Tart resources once, after every configured base image is
+	// known and before any worker can provision a runner.
+	var tartPrefixes, tartBases []string
+	for _, r := range resolved {
+		if r.runner.Tart != nil {
+			tartPrefixes = append(tartPrefixes, r.name+"-")
+			tartBases = append(tartBases, r.runner.Tart.Image)
+		}
+	}
+	var tartHostLock io.Closer
+	if len(tartPrefixes) > 0 {
+		var err error
+		tartHostLock, err = tart.AcquireHost()
+		if err != nil {
+			return fmt.Errorf("acquire Tart host lock: %w", err)
+		}
+		defer func() {
+			if err := tartHostLock.Close(); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("release Tart host lock: %w", err))
+			}
+		}()
+
+		tartProvisioner := tart.New(logger.WithGroup("tart"))
+		reconcileCtx, reconcileCancel := context.WithTimeout(ctx, 2*time.Minute)
+		reconcileErr := tartProvisioner.Reconcile(reconcileCtx, tartPrefixes, tartBases)
+		reconcileCancel()
+		closeErr := tartProvisioner.Close()
+		if reconcileErr != nil {
+			reconcileErr = fmt.Errorf("reconcile Tart runners: %w", reconcileErr)
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("close Tart provisioner after reconciliation: %w", closeErr)
+		}
+		if reconcileErr != nil || closeErr != nil {
+			return errors.Join(reconcileErr, closeErr)
+		}
+	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	for _, r := range resolved {
@@ -141,7 +178,7 @@ func run(ctx context.Context) error {
 	}
 
 	err = g.Wait()
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil {
 		return err
 	}
 
@@ -149,7 +186,7 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int) error {
+func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int) (returnErr error) {
 	logger = logger.With(slog.String("scaleSet", name))
 
 	// Create provisioner
@@ -157,10 +194,17 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	if err != nil {
 		return fmt.Errorf("runner %s: %w", name, err)
 	}
-	defer func() { _ = prov.Close() }()
+	defer func() {
+		if err := prov.Close(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("runner %s: close provisioner: %w", name, err))
+		}
+	}()
 
-	// Clean up orphans from previous runs
-	cleanupOrphans(logger, prov, name)
+	// Tart orphan cleanup is reconciled globally before workers start; libvirt
+	// retains its per-worker cleanup behavior.
+	if runner.ProviderType() != "tart" {
+		cleanupOrphans(logger, prov, name)
+	}
 
 	// Build labels
 	var labels []scaleset.Label
@@ -209,7 +253,11 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	if err != nil {
 		return fmt.Errorf("runner %s: create message session: %w", name, err)
 	}
-	defer func() { _ = sessionClient.Close(context.Background()) }()
+	defer func() {
+		if err := sessionClient.Close(context.Background()); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("runner %s: close message session: %w", name, err))
+		}
+	}()
 
 	// Create listener
 	l, err := listener.New(sessionClient, listener.Config{
@@ -234,10 +282,12 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	defer shutdownCancel()
 	scaler.Shutdown(shutdownCtx)
 
-	if !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("runner %s: listener: %w", name, err)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			returnErr = fmt.Errorf("runner %s: listener: %w", name, err)
+		}
 	}
-	return nil
+	return returnErr
 }
 
 func createProvisioner(logger *slog.Logger, runner *outrunner.RunnerConfig) (outrunner.Provisioner, error) {

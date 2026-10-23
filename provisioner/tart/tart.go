@@ -2,6 +2,7 @@ package tart
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,7 +16,10 @@ import (
 	outrunner "github.com/NetwindHQ/gha-outrunner"
 )
 
-const maxStderrLog = 1024
+const (
+	maxStderrLog   = 1024
+	cleanupTimeout = 30 * time.Second
+)
 
 // tailBuffer is an io.Writer that keeps the last maxStderrLog bytes of output.
 type tailBuffer struct {
@@ -67,47 +71,142 @@ func (s *stderrLog) CleanupFile() {
 
 // Provisioner creates ephemeral Tart VMs as GitHub Actions runners.
 // Uses `tart exec` via the guest agent for command execution.
+type provisionedVM struct {
+	cancel      context.CancelFunc
+	startupDone chan struct{}
+	processes   sync.WaitGroup
+	done        chan error
+	exitOnce    sync.Once
+	owned       bool
+	exitErr     error
+	stopping    bool
+	stopDone    chan struct{}
+	stopErr     error
+}
+
+// Provisioner creates ephemeral Tart VMs as GitHub Actions runners.
+// Uses `tart exec` via the guest agent for command execution.
 type Provisioner struct {
 	logger  *slog.Logger
 	mu      sync.Mutex
-	running map[string]context.CancelFunc
+	closed  bool
+	running map[string]*provisionedVM
 }
 
 func New(logger *slog.Logger) *Provisioner {
 	return &Provisioner{
 		logger:  logger,
-		running: make(map[string]context.CancelFunc),
+		running: make(map[string]*provisionedVM),
 	}
 }
 
 func (t *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) error {
-	if req.Runner == nil || req.Runner.Tart == nil {
-		return fmt.Errorf("no tart config for runner %s", req.Name)
+	if req == nil || req.Runner == nil || req.Runner.Tart == nil {
+		return fmt.Errorf("no tart config for runner")
+	}
+	if req.Name == "" {
+		return fmt.Errorf("no Tart VM name")
 	}
 	img := req.Runner.Tart
+	runCtx, cancel := context.WithCancel(ctx)
+	vm := &provisionedVM{
+		cancel:      cancel,
+		startupDone: make(chan struct{}),
+		done:        make(chan error, 1),
+	}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		cancel()
+		return fmt.Errorf("Tart provisioner is closed")
+	}
+	if _, exists := t.running[req.Name]; exists {
+		t.mu.Unlock()
+		cancel()
+		return fmt.Errorf("Tart VM %q is already managed", req.Name)
+	}
+	t.running[req.Name] = vm
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		close(vm.startupDone)
+		t.mu.Unlock()
+	}()
 
-	// 1. Clone from base image
+	abort := func(cause error) error {
+		cancel()
+		if !vm.owned {
+			t.removeManaged(req.Name, vm)
+			return cause
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cleanupCancel()
+		if err := t.stopOwned(cleanupCtx, req.Name, vm); err != nil {
+			return errors.Join(cause, fmt.Errorf("clean up failed Tart start %q: %w", req.Name, err))
+		}
+		t.removeManaged(req.Name, vm)
+		return cause
+	}
+
+	// 1. Claim an absent destination before clone so crash-partial clones are recoverable.
 	t.logger.Debug("Cloning VM", slog.String("image", img.Image), slog.String("name", req.Name))
-	if out, err := exec.CommandContext(ctx, "tart", "clone", img.Image, req.Name).CombinedOutput(); err != nil {
-		return fmt.Errorf("tart clone: %w: %s", err, out)
+	inventory, err := listVMs(runCtx)
+	if err != nil {
+		return abort(fmt.Errorf("check Tart clone destination: %w", err))
+	}
+	if _, exists, err := findVM(inventory, req.Name); err != nil {
+		return abort(err)
+	} else if exists {
+		return abort(fmt.Errorf("Tart VM %q already exists", req.Name))
+	}
+	if err := t.updateManifest(req.Name, cloneReserved); err != nil {
+		return abort(fmt.Errorf("reserve Tart VM ownership: %w", err))
+	}
+	vm.owned = true
+	if out, err := exec.CommandContext(runCtx, "tart", "clone", img.Image, req.Name).CombinedOutput(); err != nil {
+		cloneErr := fmt.Errorf("tart clone: %w: %s", err, out)
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		current, inventoryErr := listVMs(checkCtx)
+		checkCancel()
+		if inventoryErr != nil {
+			return abort(errors.Join(cloneErr, fmt.Errorf("check Tart clone after failure: %w", inventoryErr)))
+		}
+		_, exists, findErr := findVM(current, req.Name)
+		if findErr != nil {
+			return abort(errors.Join(cloneErr, findErr))
+		}
+		if exists && strings.Contains(strings.ToLower(string(out)), "already exists") {
+			if err := t.updateManifest(req.Name, cloneForeign); err != nil {
+				return abort(errors.Join(cloneErr, fmt.Errorf("mark colliding Tart VM as foreign: %w", err)))
+			}
+			vm.owned = false
+			cancel()
+			t.removeManaged(req.Name, vm)
+			return cloneErr
+		}
+		return abort(cloneErr)
+	}
+	if err := t.updateManifest(req.Name, cloneOwned); err != nil {
+		return abort(fmt.Errorf("record Tart clone ownership: %w", err))
 	}
 
 	// 2. Set resources
-	if out, err := exec.CommandContext(ctx, "tart", "set", req.Name,
+	if out, err := exec.CommandContext(runCtx, "tart", "set", req.Name,
 		"--cpu", strconv.Itoa(img.CPUs),
 		"--memory", strconv.Itoa(img.MemoryMB),
 	).CombinedOutput(); err != nil {
-		t.deleteVM(req.Name)
-		return fmt.Errorf("tart set: %w: %s", err, out)
+		return abort(fmt.Errorf("tart set: %w: %s", err, out))
 	}
 
 	// 3. Run in background (tart run is blocking)
-	runCtx, cancel := context.WithCancel(ctx)
 	t.mu.Lock()
-	t.running[req.Name] = cancel
-	t.mu.Unlock()
-
+	if t.closed || runCtx.Err() != nil {
+		t.mu.Unlock()
+		return abort(fmt.Errorf("Tart provisioner closed during startup"))
+	}
+	vm.processes.Add(1)
 	go func() {
+		defer vm.processes.Done()
 		t.logger.Debug("Starting VM", slog.String("name", req.Name))
 		args := []string{"run", "--no-graphics"}
 		for _, m := range img.Mounts {
@@ -118,14 +217,18 @@ func (t *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 			args = append(args, "--dir="+dir)
 		}
 		args = append(args, req.Name)
-		t.runAndLog(runCtx, req.Name, "vm", args)
+		err := t.runAndLog(runCtx, req.Name, "vm", args)
+		t.notifyExit(vm, err, runCtx)
 	}()
+	t.mu.Unlock()
 
 	// 4. Wait for guest agent
 	t.logger.Debug("Waiting for guest agent", slog.String("name", req.Name))
-	if err := t.waitForAgent(ctx, req.Name, 3*time.Minute); err != nil {
-		_ = t.Stop(ctx, req.Name)
-		return fmt.Errorf("guest agent not ready: %w", err)
+	if err := t.waitForAgent(runCtx, req.Name, 3*time.Minute); err != nil {
+		return abort(fmt.Errorf("guest agent not ready: %w", err))
+	}
+	if err := runCtx.Err(); err != nil {
+		return abort(fmt.Errorf("start Tart runner: %w", err))
 	}
 
 	// 5. Start runner via tart exec
@@ -133,17 +236,23 @@ func (t *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 	if runnerCmd == "" {
 		runnerCmd = "/actions-runner/run.sh"
 	}
-
 	t.logger.Info("Starting runner in VM",
 		slog.String("name", req.Name),
 		slog.String("cmd", runnerCmd),
 	)
-
+	t.mu.Lock()
+	if t.closed || runCtx.Err() != nil {
+		t.mu.Unlock()
+		return abort(fmt.Errorf("Tart provisioner closed during startup"))
+	}
+	vm.processes.Add(1)
 	go func() {
-		t.runAndLog(runCtx, req.Name, "runner",
+		defer vm.processes.Done()
+		err := t.runAndLog(runCtx, req.Name, "runner",
 			[]string{"exec", req.Name, runnerCmd, "--jitconfig", req.JITConfig})
+		t.notifyExit(vm, err, runCtx)
 	}()
-
+	t.mu.Unlock()
 	t.logger.Info("Runner started in VM", slog.String("name", req.Name))
 	return nil
 }
@@ -151,7 +260,7 @@ func (t *Provisioner) Start(ctx context.Context, req *outrunner.RunnerRequest) e
 // runAndLog runs a tart command, streaming stderr to a temp file.
 // On failure it logs the last 1KB of stderr inline plus the full log path.
 // On success it removes the log file.
-func (t *Provisioner) runAndLog(ctx context.Context, name, label string, args []string) {
+func (t *Provisioner) runAndLog(ctx context.Context, name, label string, args []string) error {
 	stderr, err := newStderrLog(name, label)
 	if err != nil {
 		t.logger.Warn("Failed to create stderr log, running without capture",
@@ -173,9 +282,10 @@ func (t *Provisioner) runAndLog(ctx context.Context, name, label string, args []
 				slog.String("error", err.Error()),
 			)
 		}
-		return
+		return err
 	}
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+	err = cmd.Wait()
+	if err != nil && ctx.Err() == nil {
 		attrs := []any{
 			slog.String("name", name),
 			slog.String("error", err.Error()),
@@ -191,63 +301,236 @@ func (t *Provisioner) runAndLog(ctx context.Context, name, label string, args []
 	} else if stderr != nil {
 		stderr.CleanupFile()
 	}
+	return err
+
+}
+
+func (t *Provisioner) notifyExit(vm *provisionedVM, err error, ctx context.Context) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ctx.Err() != nil || vm.stopping || t.closed {
+		return
+	}
+	vm.exitOnce.Do(func() {
+		vm.exitErr = err
+		vm.done <- err
+		close(vm.done)
+	})
+}
+
+// Done reports the runner process's first exit after successful startup.
+func (t *Provisioner) Done(name string) <-chan error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if vm, ok := t.running[name]; ok {
+		return vm.done
+	}
+	done := make(chan error, 1)
+	if t.closed {
+		done <- nil
+	} else {
+		done <- fmt.Errorf("Tart VM %q is not managed", name)
+	}
+	close(done)
+	return done
+
+}
+
+// Reconcile removes only orphaned clones recorded by this provisioner.
+func (t *Provisioner) Reconcile(ctx context.Context, prefixes, protectedBases []string) error {
+	manifest, path, err := t.ownedManifest()
+	if err != nil {
+		return err
+	}
+	inventory, err := listVMs(ctx)
+	if err != nil {
+		return err
+	}
+	protected := make(map[string]struct{}, len(protectedBases))
+	for _, base := range protectedBases {
+		protected[base] = struct{}{}
+	}
+	var cleanupErrs []error
+	for name, state := range manifest.Clones {
+		_, exists, err := findVM(inventory, name)
+		if err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+			continue
+		}
+		if !exists {
+			if err := t.removeManifestEntry(path, name); err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("remove absent Tart ownership %q: %w", name, err))
+			}
+			continue
+		}
+		if state == cloneForeign {
+			t.logger.Warn("Preserving Tart VM recorded as a foreign collision", slog.String("name", name))
+			continue
+		}
+		if _, isBase := protected[name]; isBase {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("refusing to clean owned Tart VM %q because it is a configured base image", name))
+			t.logger.Error("Refusing to clean configured Tart base image", slog.String("name", name))
+			continue
+		}
+		t.logger.Info("Cleaning up owned orphaned VM", slog.String("name", name))
+		cleanupCtx, cancel := context.WithTimeout(ctx, cleanupTimeout)
+		if err := t.deleteOwned(cleanupCtx, name, path); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+		cancel()
+	}
+	for _, vm := range inventory {
+		if _, known := manifest.Clones[vm.Name]; known {
+			continue
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(vm.Name, prefix) {
+				t.logger.Warn("Preserving Tart VM without ownership record; remove it manually if it is an orphan",
+					slog.String("name", vm.Name),
+					slog.String("prefix", prefix),
+				)
+				break
+			}
+		}
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func (t *Provisioner) deleteOwned(ctx context.Context, name, manifestPath string) error {
+	// Stop the VM (idempotent)
+	if out, err := exec.CommandContext(ctx, "tart", "stop", name).CombinedOutput(); err != nil {
+		checkCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		inventory, listErr := listVMs(checkCtx)
+		cancel()
+		if listErr != nil {
+			return errors.Join(fmt.Errorf("stop owned Tart VM %q: %w: %s", name, err, strings.TrimSpace(string(out))), listErr)
+		}
+		if vm, exists, findErr := findVM(inventory, name); findErr != nil {
+			return findErr
+		} else if exists && *vm.Running {
+			return fmt.Errorf("stop owned Tart VM %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+		}
+	}
+	// Delete the clone
+	if out, err := exec.CommandContext(ctx, "tart", "delete", name).CombinedOutput(); err != nil {
+		checkCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		inventory, listErr := listVMs(checkCtx)
+		cancel()
+		if listErr != nil {
+			return errors.Join(fmt.Errorf("delete owned Tart VM %q: %w: %s", name, err, strings.TrimSpace(string(out))), listErr)
+		}
+		if _, exists, findErr := findVM(inventory, name); findErr != nil {
+			return findErr
+		} else if exists {
+			return fmt.Errorf("delete owned Tart VM %q: %w: %s", name, err, strings.TrimSpace(string(out)))
+		}
+	}
+	checkCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	inventory, err := listVMs(checkCtx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("verify deleted Tart VM %q: %w", name, err)
+	}
+	if _, exists, err := findVM(inventory, name); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("Tart VM %q remains after deletion", name)
+	}
+	return t.removeManifestEntry(manifestPath, name)
+}
+
+func (t *Provisioner) stopOwned(ctx context.Context, name string, vm *provisionedVM) error {
+	vm.cancel()
+	processesDone := make(chan struct{})
+	go func() {
+		vm.processes.Wait()
+		close(processesDone)
+	}()
+	select {
+	case <-processesDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	manifest, path, err := t.ownedManifest()
+	if err != nil {
+		return err
+	}
+	state, owned := manifest.Clones[name]
+	if !owned || state == cloneForeign {
+		return nil
+	}
+	return t.deleteOwned(ctx, name, path)
 }
 
 func (t *Provisioner) Stop(ctx context.Context, name string) error {
-	t.logger.Debug("Stopping VM", slog.String("name", name))
-
 	t.mu.Lock()
-	if cancel, ok := t.running[name]; ok {
-		cancel()
-		delete(t.running, name)
+	vm, ok := t.running[name]
+	if !ok {
+		t.mu.Unlock()
+		return nil
 	}
+	if vm.stopping {
+		stopDone := vm.stopDone
+		t.mu.Unlock()
+		select {
+		case <-stopDone:
+			return vm.stopErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	vm.stopping = true
+	vm.stopDone = make(chan struct{})
+	stopDone := vm.stopDone
+	vm.cancel()
 	t.mu.Unlock()
 
-	// Stop the VM (idempotent)
-	_ = exec.CommandContext(ctx, "tart", "stop", name).Run()
-	// Delete the clone
-	t.deleteVM(name)
+	var err error
+	select {
+	case <-vm.startupDone:
+		err = t.stopOwned(ctx, name, vm)
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	t.mu.Lock()
+	vm.stopErr = err
+	vm.stopping = false
+	if err == nil && t.running[name] == vm {
+		delete(t.running, name)
+	}
 
-	return nil
+	close(stopDone)
+	t.mu.Unlock()
+	return err
 }
 
 func (t *Provisioner) Close() error {
 	t.mu.Lock()
-	for name, cancel := range t.running {
+	t.closed = true
+	vms := make(map[string]*provisionedVM, len(t.running))
+	for name, vm := range t.running {
+		vm.cancel()
+		vms[name] = vm
+	}
+	t.mu.Unlock()
+	var cleanupErrs []error
+	for name := range vms {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		if err := t.Stop(cleanupCtx, name); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("close Tart VM %q: %w", name, err))
+		}
 		cancel()
+	}
+	return errors.Join(cleanupErrs...)
+}
+
+func (t *Provisioner) removeManaged(name string, vm *provisionedVM) {
+	t.mu.Lock()
+	if t.running[name] == vm {
 		delete(t.running, name)
 	}
 	t.mu.Unlock()
-	return nil
-}
-
-// Cleanup removes orphaned VMs from previous runs.
-func (t *Provisioner) Cleanup(prefix string) {
-	out, err := exec.Command("tart", "list", "--quiet").Output()
-	if err != nil {
-		t.logger.Error("Failed to list VMs for cleanup", slog.String("error", err.Error()))
-		return
-	}
-
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		name := strings.TrimSpace(line)
-		if name == "" || !strings.HasPrefix(name, prefix) {
-			continue
-		}
-		t.logger.Info("Cleaning up orphaned VM", slog.String("name", name))
-		_ = exec.Command("tart", "stop", name).Run()
-		_ = exec.Command("tart", "delete", name).Run()
-	}
-}
-
-func (t *Provisioner) deleteVM(name string) {
-	if out, err := exec.Command("tart", "delete", name).CombinedOutput(); err != nil {
-		t.logger.Debug("VM delete error (may already be gone)",
-			slog.String("name", name),
-			slog.String("error", err.Error()),
-			slog.String("output", string(out)),
-		)
-	}
 }
 
 func (t *Provisioner) waitForAgent(ctx context.Context, name string, timeout time.Duration) error {

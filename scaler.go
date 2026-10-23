@@ -34,6 +34,7 @@ type Scaler struct {
 	mu      sync.Mutex
 	runners map[string]*RunnerState
 
+	shuttingDown    bool
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	wg              sync.WaitGroup
@@ -60,6 +61,9 @@ func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunner
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return len(s.runners), fmt.Errorf("scaler is shutting down")
+	}
 
 	target := min(s.maxRunners, count)
 	current := len(s.runners)
@@ -111,7 +115,7 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
-	if exists {
+	if exists && state.Phase != RunnerStopping && !s.shuttingDown {
 		state.Phase = RunnerRunning
 	}
 	s.mu.Unlock()
@@ -131,18 +135,20 @@ func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 	s.mu.Lock()
 	state, exists := s.runners[jobInfo.RunnerName]
-	s.mu.Unlock()
-
-	if exists {
+	if exists && state.Phase != RunnerStopping {
 		state.SignalDone()
 	}
+	s.mu.Unlock()
 
 	return nil
 }
 
 // Shutdown cancels all runner goroutines and waits for them to finish.
 func (s *Scaler) Shutdown(ctx context.Context) {
+	s.mu.Lock()
+	s.shuttingDown = true
 	s.lifecycleCancel()
+	s.mu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -191,7 +197,6 @@ func (s *Scaler) Runners() []RunnerSnapshot {
 // deregistration, and map cleanup.
 func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	defer s.wg.Done()
-	defer s.removeRunner(state.Name)
 
 	name := state.Name
 
@@ -201,6 +206,21 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
+		s.mu.Lock()
+		state.Phase = RunnerStopping
+		s.mu.Unlock()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		stopErr := s.provisioner.Stop(stopCtx, name)
+		stopCancel()
+		if stopErr != nil {
+			s.logger.Error("Failed to clean up partially started runner",
+				slog.String("name", name),
+				slog.String("error", stopErr.Error()),
+			)
+			s.deregisterRunner(name, state.RunnerID)
+			return
+		}
+		s.removeRunner(name)
 		s.deregisterRunner(name, state.RunnerID)
 		return
 	}
@@ -216,10 +236,20 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	state.StartedAt = time.Now()
 	s.mu.Unlock()
 
-	// 2. Wait for completion signal or shutdown
+	// 2. Wait for completion, process exit, or shutdown.
+	var providerDone <-chan error
+	if p, ok := s.provisioner.(ExitingProvisioner); ok {
+		providerDone = p.Done(name)
+	}
 	select {
 	case <-state.done:
 		s.logger.Debug("Runner signaled done", slog.String("name", name))
+	case err, ok := <-providerDone:
+		if ok && err != nil {
+			s.logger.Warn("Runner process exited", slog.String("name", name), slog.String("error", err.Error()))
+		} else {
+			s.logger.Info("Runner process exited", slog.String("name", name))
+		}
 	case <-s.lifecycleCtx.Done():
 		s.logger.Debug("Runner shutdown requested", slog.String("name", name))
 	}
@@ -237,6 +267,8 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			slog.String("name", name),
 			slog.String("error", err.Error()),
 		)
+	} else {
+		s.removeRunner(name)
 	}
 
 	// 4. Deregister from GitHub

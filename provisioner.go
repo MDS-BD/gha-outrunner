@@ -33,3 +33,10 @@ type Provisioner interface {
 	// Close releases any resources held by the provisioner (e.g., Docker client).
 	Close() error
 }
+
+// ExitingProvisioner reports when a started runner process exits independently
+// of the scaleset completion message. A nil channel means the provider does not
+// expose process exit notifications.
+type ExitingProvisioner interface {
+	Done(name string) <-chan error
+}
