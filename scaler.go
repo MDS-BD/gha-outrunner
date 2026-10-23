@@ -452,7 +452,7 @@ stop:
 }
 
 func (s *Scaler) cleanupContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(s.lifecycleCtx), timeout)
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 func (s *Scaler) markCleaning(state *RunnerState) {
