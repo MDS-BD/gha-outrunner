@@ -278,7 +278,9 @@ func (g *GroupScheduler) finishPoll(name string, offer int, msg *scaleset.Runner
 	}
 	assigned := msg != nil && len(msg.JobAssignedMessages) > 0
 	holder := len(g.order) > 0 && g.order[g.pollTurn%len(g.order)] == name
-	if holder && offer > 0 && !assigned && g.needLocked(p) <= p.leases {
+	// A poll capped at existing demand cannot reveal another queued job.
+	// Keep the turn until the pool has actually offered spare capacity.
+	if holder && offer > g.needLocked(p) && !assigned && g.needLocked(p) <= p.leases {
 		g.pollTurn = (g.pollTurn + 1) % len(g.order)
 	}
 	g.notifyLocked()

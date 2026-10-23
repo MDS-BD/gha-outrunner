@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- Retain a pool's discovery turn until it offers capacity above its existing demand, preventing an idle peer from indefinitely reserving a slot freed by job cancellation.
+
 ### Features
 
 - Shared runner groups provide process-local aggregate `max_runners` limits across runner definitions while preserving each definition's individual cap and existing behavior for ungrouped runners; queued reservations are not preempted to free capacity for other pools. Grouped Tart leases are held through confirmed clone deletion.

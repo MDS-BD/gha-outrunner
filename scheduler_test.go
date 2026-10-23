@@ -518,3 +518,53 @@ func TestGroupLeaseReleaseIsIdempotent(t *testing.T) {
 		t.Fatalf("after duplicate release: leases=%d cleaning=%d", gotLeases, gotCleaning)
 	}
 }
+
+func TestGroupDiscoversPendingJobAfterCancellation(t *testing.T) {
+	group := newTestGroup(t, 2, "a", "b")
+	a, b := newTestPoolClient(group, "a"), newTestPoolClient(group, "b")
+	acknowledgeStartupAtZero(t, a, b)
+	a.deliverDemand(2)
+	pending, capacity := beginConsumerPoll(t, a)
+	if capacity != 2 {
+		t.Fatalf("initial capacity = %d, want 2", capacity)
+	}
+	if err := completeConsumerPoll(t, a, pending, pollMessage(2), nil); err != nil {
+		t.Fatal(err)
+	}
+	first, second := group.acquire("a"), group.acquire("a")
+	if first == nil || second == nil {
+		t.Fatal("could not start both jobs")
+	}
+	defer first.Release()
+	defer second.Release()
+	// The cancellation removes one assigned job; its lease survives cleanup.
+	a.deliverDemand(1)
+	second.MarkCleaning()
+	second.Release()
+	// A capped poll has no assignment because its one remaining job fills it.
+	pending, capacity = beginConsumerPoll(t, a)
+	if err := completeConsumerPoll(t, a, pending, pollMessage(1), nil); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise both listeners: B has no jobs, while A needs to discover its
+	// still-unassigned third job without requiring a new statistics message.
+	discovered := false
+	for range 6 {
+		for _, pool := range []*testPoolClient{b, a} {
+			pending, capacity = beginConsumerPoll(t, pool)
+			demand := 0
+			if pool == a {
+				demand = 1
+				if capacity == 2 {
+					discovered = true
+				}
+			}
+			if err := completeConsumerPoll(t, pool, pending, pollMessage(demand), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !discovered {
+		t.Fatal("freed slot was never advertised to the pool with a running job")
+	}
+}
