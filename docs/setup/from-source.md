@@ -51,11 +51,10 @@ For PAT authentication, create a fine-grained token at [github.com/settings/toke
 
 ## 3. Write a config file
 
-Create `outrunner.yml` for the method you chose. For App authentication, use the configuration above; for PAT authentication, use a PAT source such as `token_file`:
+Create `outrunner.yml` for the method you chose. For App authentication, use the configuration above; for PAT authentication, retain the configuration below and supply the token with `--token`:
 
 ```yaml
 url: https://github.com/your-org/your-repo
-token_file: /etc/outrunner/token
 
 runners:
   linux:
@@ -70,8 +69,10 @@ See the [configuration reference](../reference/configuration.md) for all options
 
 ```bash
 outrunner --version
-outrunner --config outrunner.yml
+outrunner --token ghp_YOUR_TOKEN --config outrunner.yml
 ```
+
+For App authentication, run `outrunner --config outrunner.yml` without `--token`.
 
 You should see outrunner connect and start listening for jobs. Press Ctrl+C to stop.
 
