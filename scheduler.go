@@ -2,12 +2,15 @@ package outrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 )
+
+var errStaleGroupPoll = errors.New("group poll offer is stale")
 
 // GroupScheduler coordinates capacity shared by runner scale sets in one process.
 // Poll limits guide GitHub routing; leases provide the hard local capacity gate.
@@ -28,8 +31,15 @@ type groupPool struct {
 	acked      int
 	ackedKnown bool
 	inflight   int
+	activePoll *groupPoll
 	blocked    bool
 	wake       chan struct{}
+}
+
+type groupPoll struct {
+	offer     int
+	cancel    context.CancelCauseFunc
+	cancelled bool
 }
 
 type groupLease struct {
@@ -76,7 +86,17 @@ func (g *GroupScheduler) SetWake(name string, wake chan struct{}) {
 	g.mu.Unlock()
 }
 
+func (g *GroupScheduler) cancelStalePollsLocked() {
+	for name, p := range g.pools {
+		if poll := p.activePoll; poll != nil && !poll.cancelled && g.pollOfferLocked(name) != poll.offer {
+			poll.cancelled = true
+			poll.cancel(errStaleGroupPoll)
+		}
+	}
+}
+
 func (g *GroupScheduler) notifyLocked() {
+	g.cancelStalePollsLocked()
 	for _, p := range g.pools {
 		select {
 		case p.wake <- struct{}{}:
@@ -182,6 +202,7 @@ func (l *groupLease) MarkCleaning() {
 	if p := g.pools[l.pool]; p != nil && !l.cleaning {
 		l.cleaning = true
 		p.cleaning++
+		g.notifyLocked()
 	}
 	g.mu.Unlock()
 }
@@ -197,6 +218,7 @@ func (l *groupLease) UnmarkCleaning() {
 		if p.cleaning > 0 {
 			p.cleaning--
 		}
+		g.notifyLocked()
 	}
 	g.mu.Unlock()
 }
@@ -251,27 +273,34 @@ func (g *GroupScheduler) pollOfferLocked(name string) int {
 	return max(0, min(target, p.max, available))
 }
 
-func (g *GroupScheduler) beginPoll(name string) int {
+func (g *GroupScheduler) beginPoll(name string, cancel context.CancelCauseFunc) (int, *groupPoll) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	p := g.pools[name]
 	if p == nil {
-		return 0
+		return 0, nil
 	}
-	offer := g.pollOfferLocked(name)
-	p.inflight = max(p.inflight, offer)
-	return offer
+	poll := &groupPoll{offer: g.pollOfferLocked(name), cancel: cancel}
+	p.activePoll = poll
+	p.inflight = max(p.inflight, poll.offer)
+	return poll.offer, poll
 }
 
-func (g *GroupScheduler) finishPoll(name string, offer int, msg *scaleset.RunnerScaleSetMessage, err error) {
+func (g *GroupScheduler) finishPoll(name string, poll *groupPoll, msg *scaleset.RunnerScaleSetMessage, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	p := g.pools[name]
-	if p == nil || err != nil {
+	if p == nil || poll == nil {
+		return
+	}
+	if p.activePoll == poll {
+		p.activePoll = nil
+	}
+	if err != nil {
 		return
 	}
 	p.inflight = 0
-	p.acked = offer
+	p.acked = poll.offer
 	p.ackedKnown = true
 	if msg != nil && msg.Statistics != nil {
 		p.demand = max(0, msg.Statistics.TotalAssignedJobs)
@@ -280,7 +309,7 @@ func (g *GroupScheduler) finishPoll(name string, offer int, msg *scaleset.Runner
 	holder := len(g.order) > 0 && g.order[g.pollTurn%len(g.order)] == name
 	// A poll capped at existing demand cannot reveal another queued job.
 	// Keep the turn until the pool has actually offered spare capacity.
-	if holder && offer > g.needLocked(p) && !assigned && g.needLocked(p) <= p.leases {
+	if holder && poll.offer > g.needLocked(p) && !assigned && g.needLocked(p) <= p.leases {
 		g.pollTurn = (g.pollTurn + 1) % len(g.order)
 	}
 	g.notifyLocked()
@@ -306,10 +335,28 @@ func (c *GroupMessageClient) Session() scaleset.RunnerScaleSetSession {
 }
 
 func (c *GroupMessageClient) GetMessage(ctx context.Context, lastMessageID, _ int) (*scaleset.RunnerScaleSetMessage, error) {
-	offer := c.group.beginPoll(c.pool)
-	msg, err := c.inner.GetMessage(ctx, lastMessageID, offer)
-	c.group.finishPoll(c.pool, offer, msg, err)
-	return msg, err
+	for {
+		pollCtx, cancel := context.WithCancelCause(ctx)
+		offer, poll := c.group.beginPoll(c.pool, cancel)
+		msg, err := c.inner.GetMessage(pollCtx, lastMessageID, offer)
+		if err == nil {
+			c.group.finishPoll(c.pool, poll, msg, nil)
+			cancel(nil)
+			return msg, nil
+		}
+		localCancel := ctx.Err() == nil && errors.Is(err, context.Canceled) && context.Cause(pollCtx) == errStaleGroupPoll
+		if localCancel && msg != nil {
+			c.group.finishPoll(c.pool, poll, msg, nil)
+			cancel(nil)
+			return msg, nil
+		}
+		c.group.finishPoll(c.pool, poll, msg, err)
+		cancel(nil)
+		if localCancel {
+			continue
+		}
+		return msg, err
+	}
 }
 
 func (c *GroupMessageClient) DeleteMessage(ctx context.Context, messageID int) error {

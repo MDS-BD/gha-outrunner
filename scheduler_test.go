@@ -25,32 +25,59 @@ type messagePollResponse struct {
 // blockingMessageClient lets tests observe each real wrapped poll before
 // delivering its listener response.
 type blockingMessageClient struct {
-	requests  chan messagePollRequest
-	responses chan messagePollResponse
-	demand    atomic.Int64
+	requests        chan messagePollRequest
+	responses       chan chan messagePollResponse
+	demand          atomic.Int64
+	attempts        atomic.Int64
+	messageOnCancel *scaleset.RunnerScaleSetMessage
+	errorOnCancel   error
 }
 
 func newBlockingMessageClient() *blockingMessageClient {
 	return &blockingMessageClient{
 		requests:  make(chan messagePollRequest),
-		responses: make(chan messagePollResponse),
+		responses: make(chan chan messagePollResponse),
 	}
 }
 
 func (c *blockingMessageClient) GetMessage(ctx context.Context, lastMessageID, capacity int) (*scaleset.RunnerScaleSetMessage, error) {
+	c.attempts.Add(1)
 	select {
 	case c.requests <- messagePollRequest{lastMessageID: lastMessageID, capacity: capacity}:
 	case <-ctx.Done():
+		if c.errorOnCancel != nil {
+			return nil, c.errorOnCancel
+		}
+		if c.messageOnCancel != nil {
+			return c.messageOnCancel, nil
+		}
+		return nil, ctx.Err()
+	}
+	response := make(chan messagePollResponse, 1)
+	select {
+	case c.responses <- response:
+	case <-ctx.Done():
+		if c.errorOnCancel != nil {
+			return nil, c.errorOnCancel
+		}
+		if c.messageOnCancel != nil {
+			return c.messageOnCancel, nil
+		}
 		return nil, ctx.Err()
 	}
 	select {
-	case response := <-c.responses:
-		return response.message, response.err
+	case result := <-response:
+		return result.message, result.err
 	case <-ctx.Done():
+		if c.errorOnCancel != nil {
+			return nil, c.errorOnCancel
+		}
+		if c.messageOnCancel != nil {
+			return c.messageOnCancel, nil
+		}
 		return nil, ctx.Err()
 	}
 }
-
 func (c *blockingMessageClient) DeleteMessage(context.Context, int) error { return nil }
 
 func (c *blockingMessageClient) Session() scaleset.RunnerScaleSetSession {
@@ -62,6 +89,7 @@ func (c *blockingMessageClient) Session() scaleset.RunnerScaleSetSession {
 type testPoolClient struct {
 	client *GroupMessageClient
 	inner  *blockingMessageClient
+	group  *GroupScheduler
 }
 
 func newTestGroup(t *testing.T, capacity int, names ...string) *GroupScheduler {
@@ -80,7 +108,7 @@ func newTestGroup(t *testing.T, capacity int, names ...string) *GroupScheduler {
 
 func newTestPoolClient(group *GroupScheduler, name string) *testPoolClient {
 	inner := newBlockingMessageClient()
-	return &testPoolClient{client: NewGroupMessageClient(inner, group, name), inner: inner}
+	return &testPoolClient{client: NewGroupMessageClient(inner, group, name), inner: inner, group: group}
 }
 
 func (p *testPoolClient) deliverDemand(count int) {
@@ -89,8 +117,9 @@ func (p *testPoolClient) deliverDemand(count int) {
 }
 
 type pendingConsumerPoll struct {
-	cancel context.CancelFunc
-	done   chan error
+	cancel  context.CancelFunc
+	done    chan error
+	message *scaleset.RunnerScaleSetMessage
 }
 
 func beginConsumerPoll(t *testing.T, p *testPoolClient) (*pendingConsumerPoll, int) {
@@ -98,21 +127,41 @@ func beginConsumerPoll(t *testing.T, p *testPoolClient) (*pendingConsumerPoll, i
 	ctx, cancel := context.WithCancel(context.Background())
 	pending := &pendingConsumerPoll{cancel: cancel, done: make(chan error, 1)}
 	go func() {
-		_, err := p.client.GetMessage(ctx, 17, 99)
+		message, err := p.client.GetMessage(ctx, 17, 99)
+		pending.message = message
 		pending.done <- err
 	}()
+	return waitForConsumerPoll(t, p, pending)
+}
 
+func beginPollWithContext(t *testing.T, p *testPoolClient, ctx context.Context) (*pendingConsumerPoll, int) {
+	t.Helper()
+	pending := &pendingConsumerPoll{done: make(chan error, 1)}
+	go func() {
+		message, err := p.client.GetMessage(ctx, 17, 99)
+		pending.message = message
+		pending.done <- err
+	}()
+	return waitForConsumerPoll(t, p, pending)
+}
+
+func waitForConsumerPoll(t *testing.T, p *testPoolClient, pending *pendingConsumerPoll) (*pendingConsumerPoll, int) {
+	t.Helper()
 	timer := time.NewTimer(consumerPollTimeout)
 	defer timer.Stop()
 	select {
 	case request := <-p.inner.requests:
 		if request.lastMessageID != 17 {
-			cancel()
+			if pending.cancel != nil {
+				pending.cancel()
+			}
 			t.Fatalf("listener last message ID = %d, want 17", request.lastMessageID)
 		}
 		return pending, request.capacity
 	case <-timer.C:
-		cancel()
+		if pending.cancel != nil {
+			pending.cancel()
+		}
 		t.Fatal("timed out waiting for wrapped listener poll")
 		return nil, 0
 	}
@@ -120,11 +169,19 @@ func beginConsumerPoll(t *testing.T, p *testPoolClient) (*pendingConsumerPoll, i
 
 func completeConsumerPoll(t *testing.T, p *testPoolClient, pending *pendingConsumerPoll, message *scaleset.RunnerScaleSetMessage, err error) error {
 	t.Helper()
-	defer pending.cancel()
+	if pending.cancel != nil {
+		defer pending.cancel()
+	}
 	timer := time.NewTimer(consumerPollTimeout)
 	defer timer.Stop()
+	var response chan messagePollResponse
 	select {
-	case p.inner.responses <- messagePollResponse{message: message, err: err}:
+	case response = <-p.inner.responses:
+	case <-timer.C:
+		t.Fatal("timed out waiting for listener poll response channel")
+	}
+	select {
+	case response <- messagePollResponse{message: message, err: err}:
 	case <-timer.C:
 		t.Fatal("timed out delivering listener poll response")
 	}
@@ -566,5 +623,163 @@ func TestGroupDiscoversPendingJobAfterCancellation(t *testing.T) {
 	}
 	if !discovered {
 		t.Fatal("freed slot was never advertised to the pool with a running job")
+	}
+}
+
+func TestGroupStalePollIsCancelledAndReissuedWithReducedOffer(t *testing.T) {
+	group := newTestGroup(t, 3, "a", "b")
+	a, b := newTestPoolClient(group, "a"), newTestPoolClient(group, "b")
+	acknowledgeStartupAtZero(t, a, b)
+	a.deliverDemand(1)
+	aPoll, aOffer := beginConsumerPoll(t, a)
+	if aOffer != 2 {
+		t.Fatalf("A initial offer = %d, want 2", aOffer)
+	}
+	if err := completeConsumerPoll(t, a, aPoll, pollMessage(1), nil); err != nil {
+		t.Fatal(err)
+	}
+	lease := group.acquire("a")
+	if lease == nil {
+		t.Fatal("failed to seed A's active lease")
+	}
+	defer lease.Release()
+	b.deliverDemand(1)
+	bPoll, bOffer := beginConsumerPoll(t, b)
+	if bOffer != 1 {
+		t.Fatalf("B offer = %d, want 1", bOffer)
+	}
+	aPoll, aOffer = beginConsumerPoll(t, a)
+	if aOffer != 2 {
+		t.Fatalf("A active offer = %d, want 2", aOffer)
+	}
+	if err := completeConsumerPoll(t, b, bPoll, pollMessage(2), nil); err != nil {
+		t.Fatal(err)
+	}
+	group.mu.Lock()
+	acked, inflight := group.pools["a"].acked, group.pools["a"].inflight
+	group.mu.Unlock()
+	if acked != 2 || inflight != 2 {
+		t.Fatalf("A reservation awaiting downgrade acknowledgement = %d/%d, want 2/2", acked, inflight)
+	}
+	select {
+	case request := <-a.inner.requests:
+		if request.capacity != 1 {
+			t.Fatalf("reissued A offer = %d, want 1", request.capacity)
+		}
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("stale A poll was not cancelled and reissued")
+	}
+	var response chan messagePollResponse
+	select {
+	case response = <-a.inner.responses:
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("reissued poll did not accept a response")
+	}
+	select {
+	case response <- messagePollResponse{message: pollMessage(1)}:
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("timed out delivering reissued A response")
+	}
+	if err := <-aPoll.done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGroupStablePollDoesNotInterruptOnEmptyResponse(t *testing.T) {
+	group := newTestGroup(t, 2, "a", "b")
+	a, b := newTestPoolClient(group, "a"), newTestPoolClient(group, "b")
+	acknowledgeStartupAtZero(t, a, b)
+	a.deliverDemand(1)
+	pending, offer := beginConsumerPoll(t, a)
+	if offer != 2 {
+		t.Fatalf("stable A offer = %d, want 2", offer)
+	}
+	before := a.inner.attempts.Load()
+	a.deliverDemand(1)
+	if a.inner.attempts.Load() != before {
+		t.Fatal("unchanged demand restarted poll")
+	}
+	if err := completeConsumerPoll(t, a, pending, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if a.inner.attempts.Load() != before {
+		t.Fatal("empty response caused poll churn")
+	}
+}
+
+func TestGroupParentPollCancellationIsNotRetried(t *testing.T) {
+	group := newTestGroup(t, 1, "a")
+	a := newTestPoolClient(group, "a")
+	acknowledgeStartupAtZero(t, a)
+	ctx, cancel := context.WithCancel(context.Background())
+	pending, _ := beginPollWithContext(t, a, ctx)
+	cancel()
+	select {
+	case err := <-pending.done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parent cancel returned %v, want context.Canceled", err)
+		}
+	case <-time.After(consumerPollTimeout):
+		t.Fatal("parent cancellation did not return")
+	}
+	if a.inner.attempts.Load() != 2 {
+		t.Fatal("parent cancellation caused a retry")
+	}
+}
+
+func TestGroupPollOrdinaryErrorPropagates(t *testing.T) {
+	group := newTestGroup(t, 1, "a")
+	a := newTestPoolClient(group, "a")
+	acknowledgeStartupAtZero(t, a)
+	pending, _ := beginConsumerPoll(t, a)
+	want := errors.New("ordinary poll error")
+	if err := completeConsumerPoll(t, a, pending, nil, want); !errors.Is(err, want) {
+		t.Fatalf("poll error = %v, want %v", err, want)
+	}
+}
+
+func TestGroupLocalCancellationDoesNotMaskOrdinaryError(t *testing.T) {
+	group := newTestGroup(t, 1, "a")
+	a := newTestPoolClient(group, "a")
+	acknowledgeStartupAtZero(t, a)
+	want := errors.New("ordinary poll error")
+	a.inner.errorOnCancel = want
+	pending, _ := beginConsumerPoll(t, a)
+	group.BlockPool("a")
+	select {
+	case err := <-pending.done:
+		if !errors.Is(err, want) {
+			t.Fatalf("poll error after local cancellation = %v, want %v", err, want)
+		}
+	case <-time.After(consumerPollTimeout):
+		pending.cancel()
+		t.Fatal("ordinary error was swallowed after local cancellation")
+	}
+}
+
+func TestGroupMessageReturnedWithLocalCancelIsNotLost(t *testing.T) {
+	group := newTestGroup(t, 1, "a")
+	a := newTestPoolClient(group, "a")
+	acknowledgeStartupAtZero(t, a)
+	message := pollMessage(0)
+	a.inner.messageOnCancel = message
+	ctx, cancel := context.WithCancel(context.Background())
+	pending, offer := beginPollWithContext(t, a, ctx)
+	group.BlockPool("a")
+	select {
+	case err := <-pending.done:
+		cancel()
+		if err != nil || pending.message != message {
+			t.Fatalf("message/cancel result = (%p, %v), want (%p, nil)", pending.message, err, message)
+		}
+	case <-time.After(consumerPollTimeout):
+		cancel()
+		t.Fatal("message accompanying local cancellation was not returned")
+	}
+	group.mu.Lock()
+	acked, inflight := group.pools["a"].acked, group.pools["a"].inflight
+	group.mu.Unlock()
+	if acked != offer || inflight != 0 {
+		t.Fatalf("successful message accounting = %d/%d, want %d/0", acked, inflight, offer)
 	}
 }

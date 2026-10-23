@@ -5,6 +5,7 @@
 ### Fixes
 
 - Retain a pool's discovery turn until it offers capacity above its existing demand, preventing an idle peer from indefinitely reserving a slot freed by job cancellation.
+- Interrupt and reissue grouped long polls when their effective capacity offer changes, while retaining unacknowledged reservations and leaving ungrouped polling unchanged.
 
 ### Features
 

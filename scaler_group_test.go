@@ -35,11 +35,11 @@ func newReadyGroupedTestScheduler(t *testing.T, max int, pools ...groupedTestPoo
 	// A successful zero-capacity poll from every pool acknowledges the initial
 	// offers before any grouped scaler is allowed to request a lease.
 	for _, pool := range pools {
-		offer := group.beginPoll(pool.name)
+		offer, poll := group.beginPoll(pool.name, func(error) {})
 		if offer != 0 {
 			t.Fatalf("initial offer for pool %q = %d, want zero", pool.name, offer)
 		}
-		group.finishPoll(pool.name, offer, &scaleset.RunnerScaleSetMessage{
+		group.finishPoll(pool.name, poll, &scaleset.RunnerScaleSetMessage{
 			Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 0},
 		}, nil)
 	}

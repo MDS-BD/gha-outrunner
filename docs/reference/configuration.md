@@ -78,6 +78,10 @@ Group capacity is reserved before provisioning and remains occupied throughout p
 
 Use one group for every macOS definition sharing a Tart host. For example, setting each version's per-runner cap to 2 and the shared group cap to 2 permits demand to use capacity as 2+0, 1+1, or 0+2. These describe available allocation; during discovery, assigned demand may not yet be visible to the other pool, so 1+1 simultaneous allocation is not guaranteed before demand is observed. Separate groups or omitted groups do not provide this aggregate host limit. Capacity accounting is local to one controller process; do not run a second controller for the same managed Tart store.
 
+Grouped listeners interrupt an outstanding long poll only when scheduler state changes its effective capacity offer. They reissue the request without stopping the listener. Ordinary request errors and controller shutdown still propagate. Interrupted requests do not acknowledge capacity reductions: previous reservations remain charged until a successful response confirms the new offer. Unchanged offers are not restarted merely because another pool finishes an empty poll. Ungrouped listeners retain their existing polling behavior.
+
+This removes waiting for an obsolete long poll to finish naturally; it does not eliminate GitHub response time, VM cleanup, cloning, boot, or runner registration, and does not establish a fixed handoff-latency bound.
+
 The shared-group scheduling behavior has not yet been smoke-tested against a real GitHub deployment or Tart host.
 
 For the legacy 1+1 setup, omit groups and set each version's `max_runners: 1`. Existing configurations without groups retain that independent behavior.
