@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"syscall"
 	"time"
 
 	outrunner "github.com/NetwindHQ/gha-outrunner"
@@ -45,7 +46,7 @@ Each runner definition in the config file gets its own scale set. GitHub
 routes jobs to the correct scale set based on labels.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 		return run(ctx)
 	},
