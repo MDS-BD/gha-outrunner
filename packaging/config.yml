@@ -9,9 +9,11 @@
 
 url: https://github.com/your-org/your-repo
 
-
-# PAT token sources, in order of precedence:
-#
+# Token is read from (in order of precedence):
+# 1. --token CLI flag
+# 2. GITHUB_TOKEN environment variable (set in /etc/outrunner/env)
+# 3. systemd-creds ($CREDENTIALS_DIRECTORY/github-token)
+# 4. token_file below
 # Simplest option — create a token file:
 #   echo -n "ghp_YOUR_TOKEN" | sudo tee /etc/outrunner/token
 #   sudo chmod 600 /etc/outrunner/token && sudo chown outrunner:outrunner /etc/outrunner/token
@@ -22,8 +24,7 @@ token_file: /etc/outrunner/token
 # Runners inherit the global url and token_file above. To target a different
 # repository, set url (and optionally token_file) on the runner directly.
 # To share a local capacity limit across runner definitions, declare groups and
-# set group on each member. Group limits are process-local; run only one controller
-# against a Tart host and drain it before maintaining powered-off base VMs.
+# set group on each member.
 # groups:
 #   macos:
 #     max_runners: 2

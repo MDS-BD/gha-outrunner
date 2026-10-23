@@ -4,8 +4,7 @@ url: https://github.com/your-org/your-repo
 # token_file: /etc/outrunner/token
 
 # The two macOS definitions share a local cap; demand can use it as 2+0, 1+1, or 0+2.
-# Keep all macOS definitions on this host in one group. Group capacity is process-local:
-# run one controller only, and drain it before maintaining the powered-off base VMs.
+# Keep all macOS definitions on this host in one group.
 groups:
   macos:
     max_runners: 2

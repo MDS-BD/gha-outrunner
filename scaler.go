@@ -13,12 +13,15 @@ import (
 )
 
 // ScaleSetClient is the subset of scaleset.Client that Scaler uses.
+// Extracted as an interface for testability.
 type ScaleSetClient interface {
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 	RemoveRunner(ctx context.Context, runnerID int64) error
 }
 
 // Scaler implements listener.Scaler by provisioning real runner environments.
+// Each runner gets its own goroutine that manages the full lifecycle:
+// provisioning, waiting for job completion, stopping, and deregistration.
 type Scaler struct {
 	logger      *slog.Logger
 	client      ScaleSetClient
@@ -31,11 +34,10 @@ type Scaler struct {
 	group       *GroupScheduler
 	wakeCh      chan struct{}
 
-	mu             sync.Mutex
-	runners        map[string]*RunnerState
-	desired        int
-	reportedDemand int
-	launchBlocked  bool
+	mu      sync.Mutex
+	runners map[string]*RunnerState
+	desired int
+	jitErr  error
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -47,10 +49,19 @@ var _ listener.Scaler = (*Scaler)(nil)
 func NewScaler(logger *slog.Logger, client ScaleSetClient, scaleSetID, maxRunners int, namePrefix string, runner *RunnerConfig, prov Provisioner, group *GroupScheduler) *Scaler {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Scaler{
-		logger: logger, client: client, scaleSetID: scaleSetID, maxRunners: maxRunners,
-		namePrefix: namePrefix, poolName: namePrefix, runner: runner, provisioner: prov,
-		group: group, runners: make(map[string]*RunnerState), lifecycleCtx: ctx,
-		lifecycleCancel: cancel, wakeCh: make(chan struct{}, 1),
+		logger:          logger,
+		client:          client,
+		scaleSetID:      scaleSetID,
+		maxRunners:      maxRunners,
+		namePrefix:      namePrefix,
+		poolName:        namePrefix,
+		runner:          runner,
+		provisioner:     prov,
+		group:           group,
+		runners:         make(map[string]*RunnerState),
+		lifecycleCtx:    ctx,
+		lifecycleCancel: cancel,
+		wakeCh:          make(chan struct{}, 1),
 	}
 	if group != nil {
 		group.SetWake(namePrefix, s.wakeCh)
@@ -80,17 +91,17 @@ func (s *Scaler) wakeDispatcher() {
 // are asynchronous so message callbacks do not wait on GitHub or a host slot.
 func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
 	s.mu.Lock()
-	if s.lifecycleCtx.Err() != nil {
+	if s.group != nil && s.lifecycleCtx.Err() != nil {
 		current := len(s.runners)
 		s.mu.Unlock()
 		return current, nil
 	}
+	if s.jitErr != nil {
+		current, err := len(s.runners), s.jitErr
+		s.mu.Unlock()
+		return current, err
+	}
 	if s.group != nil {
-		if count != s.reportedDemand {
-			s.launchBlocked = false
-			s.reportedDemand = count
-			s.group.ResumePool(s.poolName)
-		}
 		s.desired = min(s.maxRunners, max(0, count))
 		s.group.UpdateDemand(s.poolName, max(0, count))
 		s.withdrawExcessLocked()
@@ -99,7 +110,12 @@ func (s *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		s.mu.Unlock()
 		return current, nil
 	}
-	s.desired = min(s.maxRunners, max(0, count))
+	s.desired = min(s.maxRunners, count)
+	s.logger.Debug("Desired runner count",
+		slog.Int("requested", count),
+		slog.Int("target", s.desired),
+		slog.Int("current", len(s.runners)),
+	)
 	current, err := s.startUngroupedLocked(ctx)
 	s.mu.Unlock()
 	return current, err
@@ -134,7 +150,7 @@ func (s *Scaler) withdrawExcessLocked() {
 }
 
 func (s *Scaler) launchGroupedLocked() {
-	if s.launchBlocked || s.lifecycleCtx.Err() != nil {
+	if s.jitErr != nil || s.lifecycleCtx.Err() != nil {
 		return
 	}
 	active := 0
@@ -171,30 +187,12 @@ func (s *Scaler) runGroupedRunner(state *RunnerState) {
 	if err != nil {
 		s.logger.Error("Failed to generate JIT config", slog.String("name", name), slog.String("error", err.Error()))
 		s.mu.Lock()
-		canceled := state.withdrawing || s.lifecycleCtx.Err() != nil
-		s.launchBlocked = !canceled
+		if !state.withdrawing && s.lifecycleCtx.Err() == nil {
+			s.jitErr = fmt.Errorf("generate JIT config: %w", err)
+			s.group.BlockPool(s.poolName)
+		}
 		delete(s.runners, name)
 		s.mu.Unlock()
-		if !canceled {
-			s.group.BlockPool(s.poolName)
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				timer := time.NewTimer(30 * time.Second)
-				defer timer.Stop()
-				select {
-				case <-s.lifecycleCtx.Done():
-					return
-				case <-timer.C:
-				}
-				s.mu.Lock()
-				if s.lifecycleCtx.Err() == nil {
-					s.launchBlocked = false
-					s.group.ResumePool(s.poolName)
-				}
-				s.mu.Unlock()
-			}()
-		}
 		state.lease.Release()
 		s.wake()
 		return
@@ -220,39 +218,61 @@ func (s *Scaler) runGroupedRunner(state *RunnerState) {
 	req := &RunnerRequest{Name: name, JITConfig: jit.EncodedJITConfig, Runner: s.runner}
 	s.logger.Info("Spawning runner", slog.String("name", name), slog.Int("runnerID", state.RunnerID))
 	go s.runRunnerLifecycle(state, req)
-
 }
 
 func (s *Scaler) startUngroupedLocked(ctx context.Context) (int, error) {
-	for len(s.runners) < s.desired {
+	for range s.desired - len(s.runners) {
 		name := fmt.Sprintf("%s-%s", s.namePrefix, uuid.NewString()[:8])
 		jit, err := s.client.GenerateJitRunnerConfig(ctx,
-			&scaleset.RunnerScaleSetJitRunnerSetting{Name: name}, s.scaleSetID)
+			&scaleset.RunnerScaleSetJitRunnerSetting{Name: name},
+			s.scaleSetID,
+		)
 		if err != nil {
 			return len(s.runners), fmt.Errorf("generate JIT config: %w", err)
 		}
-		state := &RunnerState{Name: name, RunnerID: jit.Runner.ID, Phase: RunnerProvisioning,
-			CreatedAt: time.Now(), done: make(chan struct{}), withdraw: make(chan struct{})}
+		state := &RunnerState{
+			Name:      name,
+			RunnerID:  jit.Runner.ID,
+			Phase:     RunnerProvisioning,
+			CreatedAt: time.Now(),
+			done:      make(chan struct{}),
+		}
 		s.runners[name] = state
-		req := &RunnerRequest{Name: name, JITConfig: jit.EncodedJITConfig, Runner: s.runner}
+		req := &RunnerRequest{
+			Name:      name,
+			JITConfig: jit.EncodedJITConfig,
+			Runner:    s.runner,
+		}
+		s.logger.Info("Spawning runner",
+			slog.String("name", name),
+			slog.Int("runnerID", state.RunnerID),
+		)
 		s.wg.Add(1)
 		go s.runRunnerLifecycle(state, req)
 	}
 	return len(s.runners), nil
 }
 
-func (s *Scaler) HandleJobStarted(_ context.Context, jobInfo *scaleset.JobStarted) error {
+func (s *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	s.mu.Lock()
-	if state, exists := s.runners[jobInfo.RunnerName]; exists {
+	state, exists := s.runners[jobInfo.RunnerName]
+	if exists {
 		state.Phase = RunnerRunning
 	}
 	s.mu.Unlock()
-	s.logger.Info("Job started", slog.String("runnerName", jobInfo.RunnerName), slog.Int64("requestId", jobInfo.RunnerRequestID))
+
+	s.logger.Info("Job started",
+		slog.String("runnerName", jobInfo.RunnerName),
+		slog.Int64("requestId", jobInfo.RunnerRequestID),
+	)
 	return nil
 }
 
-func (s *Scaler) HandleJobCompleted(_ context.Context, jobInfo *scaleset.JobCompleted) error {
-	s.logger.Info("Job completed", slog.String("runnerName", jobInfo.RunnerName), slog.String("result", jobInfo.Result))
+func (s *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
+	s.logger.Info("Job completed",
+		slog.String("runnerName", jobInfo.RunnerName),
+		slog.String("result", jobInfo.Result),
+	)
 	s.mu.Lock()
 	if state, exists := s.runners[jobInfo.RunnerName]; exists {
 		state.SignalDone()
@@ -269,7 +289,7 @@ func (s *Scaler) markCleaningLocked(state *RunnerState) {
 	}
 }
 
-// Shutdown cancels runner lifecycles and waits for all scheduled work.
+// Shutdown cancels all runner goroutines and waits for them to finish.
 func (s *Scaler) Shutdown(ctx context.Context) {
 	s.mu.Lock()
 	s.lifecycleCancel()
@@ -292,7 +312,8 @@ func (s *Scaler) Shutdown(ctx context.Context) {
 	}
 }
 
-// RunnerSnapshot is a point-in-time copy of a runner's state.
+// RunnerSnapshot is a point-in-time copy of a runner's state, safe to read
+// without holding the scaler's mutex.
 type RunnerSnapshot struct {
 	Name      string
 	RunnerID  int
@@ -305,21 +326,40 @@ type RunnerSnapshot struct {
 func (s *Scaler) Runners() []RunnerSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	snapshots := make([]RunnerSnapshot, 0, len(s.runners))
 	for _, state := range s.runners {
 		snapshots = append(snapshots, RunnerSnapshot{
-			Name: state.Name, RunnerID: state.RunnerID, Phase: state.Phase,
-			CreatedAt: state.CreatedAt, StartedAt: state.StartedAt,
+			Name:      state.Name,
+			RunnerID:  state.RunnerID,
+			Phase:     state.Phase,
+			CreatedAt: state.CreatedAt,
+			StartedAt: state.StartedAt,
 		})
 	}
 	return snapshots
 }
 
+// runRunnerLifecycle manages the full lifecycle of a single runner.
+// Runs in its own goroutine. Handles provisioning, waiting, stopping,
+// deregistration, and map cleanup.
 func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 	defer s.wg.Done()
+	if state.lease == nil {
+		defer s.removeRunner(state.Name)
+	}
 	name := state.Name
+
+	// 1. Provision
 	if err := s.provisioner.Start(s.lifecycleCtx, req); err != nil {
-		s.logger.Error("Failed to start runner", slog.String("name", name), slog.String("error", err.Error()))
+		s.logger.Error("Failed to start runner",
+			slog.String("name", name),
+			slog.String("error", err.Error()),
+		)
+		if state.lease == nil {
+			s.deregisterRunner(name, state.RunnerID)
+			return
+		}
 		s.markCleaning(state)
 		stopCtx, cancel := s.cleanupContext(2 * time.Minute)
 		stopErr := s.provisioner.Stop(stopCtx, name)
@@ -330,37 +370,28 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 		}
 		s.deregisterRunner(name, state.RunnerID)
 		s.removeRunner(name)
-		if state.lease != nil {
-			state.lease.Release()
-		}
+		s.releaseRunnerLease(state)
 		s.wake()
 		return
 	}
 
 	s.mu.Lock()
-	if state.Phase != RunnerRunning && state.Phase != RunnerStopping {
+	if state.Phase == RunnerRunning {
+		// HandleJobStarted arrived during provisioning
+		s.logger.Info("Runner provisioned (job already assigned)", slog.String("name", name))
+	} else {
 		state.Phase = RunnerIdle
+		s.logger.Info("Runner provisioned", slog.String("name", name))
 	}
 	state.StartedAt = time.Now()
 	s.mu.Unlock()
-
-	var doneCh <-chan error
-	if monitor, ok := s.provisioner.(interface{ Done(string) <-chan error }); ok {
-		doneCh = monitor.Done(name)
-	}
 	withdrawn := false
+	// Wait for completion, withdrawal, or shutdown.
 	for {
 		s.mu.Lock()
 		withdrawCh := state.withdraw
 		s.mu.Unlock()
 		select {
-		case err := <-doneCh:
-			if err != nil {
-				s.logger.Error("Runner environment exited unexpectedly", slog.String("name", name), slog.String("error", err.Error()))
-			} else {
-				s.logger.Info("Runner environment exited", slog.String("name", name))
-			}
-			goto stop
 		case <-withdrawCh:
 			withdrawCtx, withdrawCancel := s.cleanupContext(10 * time.Second)
 			err := s.client.RemoveRunner(withdrawCtx, int64(state.RunnerID))
@@ -380,29 +411,40 @@ func (s *Scaler) runRunnerLifecycle(state *RunnerState, req *RunnerRequest) {
 			withdrawn = true
 			goto stop
 		case <-state.done:
+			s.logger.Debug("Runner signaled done", slog.String("name", name))
 			goto stop
 		case <-s.lifecycleCtx.Done():
+			s.logger.Debug("Runner shutdown requested", slog.String("name", name))
 			goto stop
 		}
 	}
 
 stop:
+	// 3. Stop
+	s.logger.Info("Stopping runner", slog.String("name", name))
 	s.markCleaning(state)
 	s.mu.Lock()
 	state.Phase = RunnerStopping
 	s.mu.Unlock()
+
 	stopCtx, cancel := s.cleanupContext(2 * time.Minute)
 	stopErr := s.provisioner.Stop(stopCtx, name)
 	cancel()
 	if stopErr != nil {
-		s.logger.Error("Failed to stop runner", slog.String("name", name), slog.String("error", stopErr.Error()))
-		return
+		s.logger.Error("Failed to stop runner",
+			slog.String("name", name),
+			slog.String("error", stopErr.Error()),
+		)
+		if state.lease != nil {
+			return
+		}
 	}
+
+	// 4. Deregister from GitHub
 	if !withdrawn {
 		s.deregisterRunner(name, state.RunnerID)
 	}
 	s.removeRunner(name)
-
 	if state.lease != nil {
 		state.lease.Release()
 	}
@@ -417,6 +459,10 @@ func (s *Scaler) markCleaning(state *RunnerState) {
 	s.mu.Lock()
 	s.markCleaningLocked(state)
 	s.mu.Unlock()
+}
+
+func (s *Scaler) releaseRunnerLease(state *RunnerState) {
+	state.lease.Release()
 }
 
 func (s *Scaler) removeRunner(name string) {
@@ -439,9 +485,13 @@ func (s *Scaler) deregisterRunner(name string, runnerID int) {
 	if runnerID == 0 {
 		return
 	}
-	ctx, cancel := s.cleanupContext(10 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := s.client.RemoveRunner(ctx, int64(runnerID)); err != nil {
-		s.logger.Warn("Failed to deregister runner", slog.String("name", name), slog.Int("runnerID", runnerID), slog.String("error", err.Error()))
+		s.logger.Warn("Failed to deregister runner",
+			slog.String("name", name),
+			slog.Int("runnerID", runnerID),
+			slog.String("error", err.Error()),
+		)
 	}
 }

@@ -1,6 +1,5 @@
-# Shared two-slot macOS pool on one Apple Silicon host.
-# Use prepared, powered-off base VMs; Tart creates a disposable clone per job.
-# Existing 1+1 setup: omit groups and set each runner's max_runners to 1.
+# macOS VM via Tart (Apple Silicon only).
+# Requires: Tart installed; provide the two prepared, powered-off base VMs (ci-macos-26-base and ci-macos-27-base).
 url: https://github.com/your-org/your-repo
 # token_file: /etc/outrunner/token
 
@@ -28,3 +27,14 @@ runners:
       runner_cmd: /Users/runner/actions-runner/run.sh
       cpus: 4
       memory: 8192
+# Optional: share host directories into the VM via virtiofs (--dir).
+# On macOS guests: accessible at /Volumes/My Shared Files/<name>
+# On Linux guests: mount manually with:
+#   mount -t virtiofs com.apple.virtio-fs.automount /mnt/shared
+#   then access at /mnt/shared/<name>
+# mounts:
+#   - name: vcpkg
+#     source: /var/cache/vcpkg
+#   - name: cargo
+#     source: /var/cache/cargo
+#     read_only: false

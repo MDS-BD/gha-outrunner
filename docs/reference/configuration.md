@@ -6,14 +6,12 @@ outrunner uses a YAML configuration file. Default location: `/etc/outrunner/conf
 
 ```yaml
 url: <string>                        # Global repository or org URL.
-groups:                               # Optional local capacity groups.
-  <group-name>:
-    max_runners: <positive int>       # Aggregate cap shared by member runners.
+token_file: <string>                 # Global path to a file containing the GitHub token.
 
 runners:
   <scale-set-name>:                  # The key becomes the GitHub scale set name.
     url: <string>                    # Optional per-runner URL override.
-    token_file: <string>             # Optional per-runner PAT override; overrides global App.
+    token_file: <string>             # Optional per-runner token file override.
     labels: [<string>, ...]          # Labels registered on this scale set.
     group: <string>                  # Optional local group name.
     max_runners: <int>               # Optional. Defaults to --max-runners flag.
@@ -55,28 +53,30 @@ Every runner must have a URL reachable via the resolution chain: per-runner `url
 url: https://github.com/myorg/myrepo
 ```
 
-
 ### `token_file`
 
-Global path to a file containing the GitHub PAT. The file should contain just the token, with optional trailing whitespace/newline.
+Global path to a file containing the GitHub PAT. The file should contain just the token, with optional trailing whitespace/newline. Applies to all runners that don't set their own `token_file`.
 
 ```yaml
 token_file: /etc/outrunner/token
 ```
 
-See the [Linux setup guides](../setup/linux-deb.md) for details on configuring a token.
+Token resolution precedence:
+1. Per-runner `token_file` (if set on the runner)
+2. `--token` CLI flag
+3. `GITHUB_TOKEN` environment variable
+4. `$CREDENTIALS_DIRECTORY/github-token` (systemd-creds)
+5. Global `token_file` from config
+
+See the [Linux setup guides](../setup/linux-deb.md) for details on each method.
 
 ### `groups`
 
 **Optional.** Defines process-local capacity groups shared by runner definitions. Each group must declare a positive `max_runners`; any runner with `group` must reference a configured group. A group cap limits the aggregate number of admitted runners across its member definitions. The per-runner `max_runners` remains an independent upper bound; it may be greater than the group cap. Runners without a group keep the existing independent capacity behavior. These are local scheduler groups, not GitHub organization runner groups.
 
-Group capacity is reserved before provisioning and remains occupied throughout provisioning, execution, stopping, and cleanup. A JIT-only failure before any resource is created can release its reservation immediately; otherwise capacity is released only once cleanup is confirmed. If cleanup fails or resource absence cannot be established, the slot remains quarantined and replacement admission is blocked until the controller restarts and startup reconciliation successfully confirms cleanup. Configured base images and unrelated VMs are protected.
-
-A failed JIT registration before resource creation releases its lease and pauses the affected pool for 30 seconds before retrying. Shutdown cancels the retry. Quarantining one failed-cleanup environment does not consume otherwise free capacity beyond that environment's reservation.
+Group capacity is reserved before provisioning and remains occupied throughout provisioning, execution, stopping, and cleanup. A failed Tart stop/delete or unavailable VM inventory leaves that grouped runner slot reserved for the remainder of the controller process. Other provisioner cleanup behavior is unchanged.
 
 Use one group for every macOS definition sharing a Tart host. For example, setting each version's per-runner cap to 2 and the shared group cap to 2 permits demand to use capacity as 2+0, 1+1, or 0+2. These describe available allocation; during discovery, assigned demand may not yet be visible to the other pool, so 1+1 simultaneous allocation is not guaranteed before demand is observed. Separate groups or omitted groups do not provide this aggregate host limit. Capacity accounting is local to one controller process; do not run a second controller for the same managed Tart store.
-
-Group scheduling accounts for acknowledged and in-flight poll offers as well as active reservations against the shared cap. Every pool first acknowledges a zero-capacity poll before new capacity is offered. A reduced offer releases capacity only after a successful poll roundtrip; on poll errors, the prior offer remains accounted for. Discovery offers rotate among pools, and known demand receives round-robin admission without preempting running jobs. Falling demand cancels unlaunched JIT work; an idle runner is removed only after GitHub accepts deregistration. Rejected deregistration leaves its environment running. This is not a guarantee of GitHub's global queued-job FIFO order.
 
 The shared-group scheduling behavior has not yet been smoke-tested against a real GitHub deployment or Tart host.
 
@@ -103,20 +103,12 @@ runners:
 
 ### `runners.<name>.token_file`
 
-**Optional.** Per-runner token file override. When set, this runner authenticates with the token from this file instead of the global token resolution chain. Useful when different repositories require different PATs; also explicitly selects PAT auth when a global App is configured.
-
-### `runners.<name>.app`
-
-**Optional.** Per-runner GitHub App credential override. It follows the same fields and permissions as the top-level `app`. When set, it takes precedence over the global App and all PAT sources. Do not set it together with that runner's `token_file`.
-
-The private-key file is read and validated as an RSA PEM key when outrunner resolves credentials at startup. Its contents are never written to logs or runner environments.
+**Optional.** Per-runner token file override. When set, this runner authenticates with the token from this file instead of the global token resolution chain. Useful when different repositories require different PATs.
 
 ### `runners.<name>.labels`
 
 **Required.** An array of labels registered on this runner's scale set. GitHub uses these labels to route jobs.
-
 ```yaml
-# In config:
 runners:
   linux-docker:
     labels: [self-hosted, linux, x64]
@@ -200,14 +192,11 @@ Provisions a Tart virtual machine per job by cloning from a base image.
 
 ## Examples
 
-Minimal (Docker, GitHub App):
+Minimal (Docker, single runner):
 
 ```yaml
 url: https://github.com/myorg/myrepo
-app:
-  client_id: Iv1.example-client-id
-  installation_id: 12345678
-  private_key_file: /etc/outrunner/github-app.pem
+token_file: /etc/outrunner/token
 
 runners:
   linux:
@@ -218,12 +207,8 @@ runners:
 
 Mixed backends with shared cache:
 
-```yaml
 url: https://github.com/myorg
-app:
-  client_id: Iv1.example-client-id
-  installation_id: 12345678
-  private_key_file: /etc/outrunner/github-app.pem
+token_file: /etc/outrunner/token
 
 runners:
   linux:
@@ -259,16 +244,12 @@ runners:
           source: /var/cache/vcpkg
 ```
 
+
 Multi-repo (runners targeting different repositories):
 
 ```yaml
 url: https://github.com/myorg/main-repo
-app:
-  client_id: Iv1.example-client-id
-  installation_id: 12345678
-  private_key_file: /etc/outrunner/github-app.pem
-
-token_file: /etc/outrunner/token-infra
+token_file: /etc/outrunner/token
 
 runners:
   main-linux:

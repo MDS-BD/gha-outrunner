@@ -32,13 +32,13 @@ func (p RunnerPhase) String() string {
 	}
 }
 
-// RunnerState holds one runner lifecycle and its local capacity lease.
+// RunnerState holds the full state of a single runner instance.
 type RunnerState struct {
 	Name      string
-	RunnerID  int
+	RunnerID  int // from GenerateJitRunnerConfig().Runner.ID
 	Phase     RunnerPhase
 	CreatedAt time.Time
-	StartedAt time.Time
+	StartedAt time.Time // when Start() completed (provisioning finished)
 
 	done         chan struct{}
 	doneOnce     sync.Once
@@ -51,6 +51,8 @@ type RunnerState struct {
 	withdrawing  bool
 }
 
+// SignalDone closes the done channel, signaling the runner goroutine to stop.
+// Safe to call multiple times.
 func (r *RunnerState) SignalDone() {
 	r.doneOnce.Do(func() { close(r.done) })
 }

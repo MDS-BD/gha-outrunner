@@ -4,8 +4,7 @@
 
 ### Features
 
-- Shared runner groups provide process-local aggregate `max_runners` limits across runner definitions while preserving each definition's individual cap and existing behavior for ungrouped runners; queued reservations are not preempted to free capacity for other pools.
-- Tart group reservations remain held through confirmed clone cleanup; startup reconciliation and host ownership protect base images, unrelated VMs, and against multiple controllers managing one Tart store.
+- Shared runner groups provide process-local aggregate `max_runners` limits across runner definitions while preserving each definition's individual cap and existing behavior for ungrouped runners; queued reservations are not preempted to free capacity for other pools. Grouped Tart leases are held through confirmed clone deletion.
 
 The shared-group scheduling behavior has not yet been smoke-tested against a real GitHub deployment or Tart host.
 

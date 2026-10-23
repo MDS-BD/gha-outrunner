@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"syscall"
 	"time"
 
 	outrunner "github.com/NetwindHQ/gha-outrunner"
@@ -47,7 +46,7 @@ routes jobs to the correct scale set based on labels. Local runner groups
 share process-local capacity without changing GitHub runner groups.`,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
 		defer cancel()
 		return run(ctx)
 	},
@@ -140,89 +139,47 @@ func run(ctx context.Context) error {
 			clients[key] = c
 			logger.Info("Created scaleset client", slog.String("url", url))
 		}
-		resolved = append(resolved, resolvedRunner{name: name, runner: runner, maxRunners: maxRunners, key: key, group: group})
-	}
 
-	// Hold exclusive host ownership and reconcile all managed Tart resources
-	// before any listener can advertise or provision capacity.
-	var hostLock *os.File
-	var tartBases, tartPrefixes []string
-	for _, item := range resolved {
-		if item.runner.Tart != nil {
-			tartBases = append(tartBases, item.runner.Tart.Image)
-			tartPrefixes = append(tartPrefixes, item.name+"-")
-		}
-	}
-	if len(tartPrefixes) > 0 {
-		hostLock, err = tart.AcquireHost()
-		if err != nil {
-			return fmt.Errorf("acquire Tart host ownership: %w", err)
-		}
-		defer func() {
-			if closeErr := hostLock.Close(); closeErr != nil {
-				logger.Error("Failed to release Tart host ownership", slog.String("error", closeErr.Error()))
-			}
-		}()
-		for _, item := range resolved {
-			if item.runner.Tart == nil {
-				continue
-			}
-			prov := tart.New(logger.WithGroup("tart"), tartBases, tartPrefixes)
-			if err := prov.Reconcile(ctx, tartPrefixes, tartBases); err != nil {
-				if closeErr := prov.Close(); closeErr != nil {
-					logger.Error("Failed to close Tart reconciler", slog.String("error", closeErr.Error()))
-				}
-				return fmt.Errorf("reconcile Tart host: %w", err)
-			}
-			if err := prov.Close(); err != nil {
-				return fmt.Errorf("close Tart reconciler: %w", err)
-			}
-			break
-		}
-	}
-	for _, item := range resolved {
-		if item.runner.Tart != nil {
-			continue
-		}
-		prov, err := createProvisioner(logger.With(slog.String("scaleSet", item.name)), &item.runner, tartBases, tartPrefixes)
-		if err != nil {
-			return fmt.Errorf("runner %s: create cleanup provisioner: %w", item.name, err)
-		}
-		if cleaner, ok := prov.(interface{ Cleanup(string) }); ok {
-			cleaner.Cleanup(item.name + "-")
-		}
-		if err := prov.Close(); err != nil {
-			return fmt.Errorf("runner %s: close cleanup provisioner: %w", item.name, err)
-		}
-	}
-
-	workerGroup, workerCtx := errgroup.WithContext(ctx)
-	for _, item := range resolved {
-		item := item
-		client := clients[item.key]
-		workerGroup.Go(func() error {
-			return runWorker(workerCtx, logger, listenerLogger, client, item.name, &item.runner, item.maxRunners, item.group, tartBases, tartPrefixes)
+		resolved = append(resolved, resolvedRunner{
+			name:       name,
+			runner:     runner,
+			maxRunners: maxRunners,
+			key:        key,
+			group:      group,
 		})
 	}
-	if err := workerGroup.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+
+	g, ctx := errgroup.WithContext(ctx)
+	for _, r := range resolved {
+		client := clients[r.key]
+		g.Go(func() error {
+			return runWorker(ctx, logger, listenerLogger, client, r.name, &r.runner, r.maxRunners, r.group)
+		})
+	}
+
+	err = g.Wait()
+	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
+
 	logger.Info("Shut down cleanly")
 	return nil
 }
 
-func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int, group *outrunner.GroupScheduler, tartBases, tartPrefixes []string) (retErr error) {
+func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client *scaleset.Client, name string, runner *outrunner.RunnerConfig, maxRunners int, group *outrunner.GroupScheduler) error {
 	logger = logger.With(slog.String("scaleSet", name))
-	prov, err := createProvisioner(logger, runner, tartBases, tartPrefixes)
+
+	// Create provisioner
+	prov, err := createProvisioner(logger, runner)
 	if err != nil {
 		return fmt.Errorf("runner %s: %w", name, err)
 	}
-	defer func() {
-		if closeErr := prov.Close(); closeErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("runner %s: close provisioner: %w", name, closeErr))
-		}
-	}()
+	defer func() { _ = prov.Close() }()
 
+	// Clean up orphans from previous runs
+	cleanupOrphans(logger, prov, name)
+
+	// Build labels
 	var labels []scaleset.Label
 	for _, l := range runner.Labels {
 		labels = append(labels, scaleset.Label{Name: l, Type: "User"})
@@ -271,6 +228,7 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	}
 	defer func() { _ = sessionClient.Close(context.Background()) }()
 
+	// Create listener
 	var messageClient listener.Client = sessionClient
 	listenerMax := maxRunners
 	if group != nil {
@@ -285,6 +243,8 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	if err != nil {
 		return fmt.Errorf("runner %s: create listener: %w", name, err)
 	}
+
+	// Create scaler
 	scaler := outrunner.NewScaler(
 		logger.WithGroup("scaler"),
 		client, scaleSet.ID, maxRunners, name, runner, prov, group,
@@ -303,7 +263,7 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 	return nil
 }
 
-func createProvisioner(logger *slog.Logger, runner *outrunner.RunnerConfig, tartBases, tartPrefixes []string) (outrunner.Provisioner, error) {
+func createProvisioner(logger *slog.Logger, runner *outrunner.RunnerConfig) (outrunner.Provisioner, error) {
 	switch runner.ProviderType() {
 	case "docker":
 		return docker.New(logger.WithGroup("docker"))
@@ -312,7 +272,7 @@ func createProvisioner(logger *slog.Logger, runner *outrunner.RunnerConfig, tart
 			Socket: runner.Libvirt.Socket,
 		})
 	case "tart":
-		return tart.New(logger.WithGroup("tart"), tartBases, tartPrefixes), nil
+		return tart.New(logger.WithGroup("tart"), runner.Group != ""), nil
 	default:
 		return nil, fmt.Errorf("unknown provider type %q", runner.ProviderType())
 	}
@@ -333,4 +293,15 @@ func labelsMatch(existing []scaleset.Label, desired []scaleset.Label) bool {
 		}
 	}
 	return true
+}
+
+// cleanupOrphans removes leftover resources from previous runs.
+func cleanupOrphans(logger *slog.Logger, prov outrunner.Provisioner, name string) {
+	prefix := name + "-"
+	type cleaner interface {
+		Cleanup(prefix string)
+	}
+	if c, ok := prov.(cleaner); ok {
+		c.Cleanup(prefix)
+	}
 }

@@ -104,15 +104,6 @@ func (g *GroupScheduler) BlockPool(name string) {
 	g.mu.Unlock()
 }
 
-func (g *GroupScheduler) ResumePool(name string) {
-	g.mu.Lock()
-	if p := g.pools[name]; p != nil && p.blocked {
-		p.blocked = false
-		g.notifyLocked()
-	}
-	g.mu.Unlock()
-}
-
 func (g *GroupScheduler) needLocked(p *groupPool) int {
 	if p.blocked {
 		return p.leases + p.cleaning

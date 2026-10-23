@@ -244,7 +244,6 @@ func TestProvisioningFailure(t *testing.T) {
 		t.Errorf("expected 1 RemoveRunner call, got %d", client.removeCount.Load())
 	}
 
-
 	s.Shutdown(context.Background())
 }
 
