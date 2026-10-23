@@ -80,11 +80,13 @@ Use one group for every macOS definition sharing a Tart host. For example, setti
 
 Grouped listeners interrupt an outstanding long poll only when scheduler state changes its effective capacity offer. They reissue the request without stopping the listener. Ordinary request errors and controller shutdown still propagate. Interrupted requests do not acknowledge capacity reductions: previous reservations remain charged until a successful response confirms the new offer. Unchanged offers are not restarted merely because another pool finishes an empty poll. Ungrouped listeners retain their existing polling behavior.
 
-When all pools have no assigned demand or VM reservations, discovery-only capacity decreases wait for the outstanding poll's natural completion. Capacity increases may still interrupt a poll so an undiscovered queued job does not wait behind a zero-capacity request. Intentional stale-offer cancellations are logged at DEBUG by the grouped session's HTTP client, not ERROR; genuine transport errors and ordinary shutdown cancellation remain distinct. Ungrouped sessions use their existing HTTP logging.
+When all pools have no assigned demand or VM reservations, discovery-only capacity decreases wait for the outstanding poll's natural completion. Capacity increases may still interrupt a poll so an undiscovered queued job does not wait behind a zero-capacity request. Intentional stale-offer cancellations are logged at DEBUG by the grouped session's HTTP client, not ERROR; genuine transport errors and ordinary shutdown cancellation remain distinct.
 
 This removes waiting for an obsolete long poll to finish naturally; it does not eliminate GitHub response time, VM cleanup, cloning, boot, or runner registration, and does not establish a fixed handoff-latency bound.
 
 The shared-group scheduling behavior has not yet been smoke-tested against a real GitHub deployment or Tart host.
+
+The GitHub SDK and its HTTP retry clients use the application's structured logging policy: root API operations use INFO, while listener/session operations use WARN. Routine HTTP request DEBUG messages are therefore hidden at the default levels, including root GET/POST/PATCH calls; genuine HTTP errors remain visible. This applies to both grouped and ungrouped sessions without changing their polling or retry behavior.
 
 For the legacy 1+1 setup, omit groups and set each version's `max_runners: 1`. Existing configurations without groups retain that independent behavior.
 

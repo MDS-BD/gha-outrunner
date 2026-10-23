@@ -129,10 +129,11 @@ func run(ctx context.Context) error {
 
 		key := clientKey{url: url, token: token}
 		if _, ok := clients[key]; !ok {
+			httpOptions := outrunner.GitHubHTTPOptions(logger.WithGroup("github"))
 			c, err := scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
 				GitHubConfigURL:     url,
 				PersonalAccessToken: token,
-			})
+			}, httpOptions...)
 			if err != nil {
 				return fmt.Errorf("runner %s: create scaleset client: %w", name, err)
 			}
@@ -224,7 +225,10 @@ func runWorker(ctx context.Context, logger, listenerLogger *slog.Logger, client 
 
 	var sessionOptions []scaleset.HTTPOption
 	if group != nil {
+		sessionOptions = append(sessionOptions, scaleset.WithLogger(listenerLogger.WithGroup("listener.http")))
 		sessionOptions = append(sessionOptions, outrunner.GroupedPollHTTPOption(listenerLogger.WithGroup("listener.http")))
+	} else {
+		sessionOptions = outrunner.GitHubHTTPOptions(listenerLogger.WithGroup("listener.http"))
 	}
 	sessionClient, err := client.MessageSessionClient(ctx, scaleSet.ID, hostname, sessionOptions...)
 	if err != nil {

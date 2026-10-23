@@ -6,11 +6,34 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/actions/scaleset"
 	"github.com/hashicorp/go-retryablehttp"
 )
+
+// newGitHubRetryableHTTPClient routes retry logs through slog without letting
+// the SDK's one-off admin-connection retry policy leak into later requests.
+func newGitHubRetryableHTTPClient(logger *slog.Logger) *retryablehttp.Client {
+	client := retryablehttp.NewClient()
+	client.Logger = logger
+	client.RequestLogHook = func(_ retryablehttp.Logger, request *http.Request, _ int) {
+		if !strings.HasSuffix(request.URL.Path, "/actions/runner-registration") {
+			client.CheckRetry = retryablehttp.DefaultRetryPolicy
+			client.ErrorHandler = nil
+		}
+	}
+	return client
+}
+
+// GitHubHTTPOptions configures SDK and retryable HTTP logs with a fresh client.
+func GitHubHTTPOptions(logger *slog.Logger) []scaleset.HTTPOption {
+	return []scaleset.HTTPOption{
+		scaleset.WithLogger(logger),
+		scaleset.WithRetryableHTTPClint(newGitHubRetryableHTTPClient(logger)),
+	}
+}
 
 type stalePollLog struct {
 	mu     sync.Mutex
