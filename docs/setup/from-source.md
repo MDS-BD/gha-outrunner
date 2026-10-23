@@ -48,6 +48,7 @@ For PAT authentication, create a fine-grained token at [github.com/settings/toke
 - **Resource owner:** Your user or organization
 - **Repository access:** Select the repository you want to use
 - **Permissions:** Administration -> Read and write
+
 ## 3. Write a config file
 
 Create `outrunner.yml` for the method you chose. For App authentication, use the configuration above; for PAT authentication, use a PAT source such as `token_file`:
@@ -68,6 +69,7 @@ See the [configuration reference](../reference/configuration.md) for all options
 ## 4. Verify
 
 ```bash
+outrunner --version
 outrunner --config outrunner.yml
 ```
 
